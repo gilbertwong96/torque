@@ -11,11 +11,12 @@
 
 use rustler::sys::{
     enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
-    enif_make_uint64, ERL_NIF_TERM,
+    enif_make_uint64, enif_system_info, ErlNifSysInfo, ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
@@ -63,11 +64,11 @@ struct KeyEntry {
 /// invalidated between calls by an epoch counter, since terms are only valid
 /// within the env of the call that made them.
 ///
-/// Cached keys are built as *copied* heap binaries rather than sub-binaries.
-/// On OTP 28+ this matches what `enif_make_sub_binary` does anyway (slices
-/// ≤ 64 bytes are copied on-heap); on older OTPs it avoids real sub-binaries
-/// that would pin the whole input binary via the decoded map's keys. The copy
-/// is once per distinct key per call — amortized by the cache.
+/// Cached keys are copies, never references to the input: a map's keys can
+/// outlive its values, and would otherwise pin the whole input. On OTP 27+
+/// `enif_make_sub_binary` copies a slice of at most 64 bytes onto the heap,
+/// and does it cheaper than `enif_make_new_binary`, which flushes the env's
+/// heap pointers around an `HAlloc`; older releases get the explicit copy.
 struct KeyCache {
     entries: [KeyEntry; KEY_CACHE_SLOTS],
     epoch: u32,
@@ -109,6 +110,28 @@ impl KeyCache {
             self.epoch = 1;
         }
     }
+}
+
+/// Whether `enif_make_sub_binary` copies a slice of `KEY_CACHE_MAX_LEN` bytes
+/// or fewer onto the heap, as it does from OTP 27 on.
+fn sub_binaries_copy_keys() -> bool {
+    static COPIES: OnceLock<bool> = OnceLock::new();
+    *COPIES.get_or_init(|| {
+        // SAFETY: `enif_system_info` fills at most `size_of::<ErlNifSysInfo>()`
+        // bytes, and `otp_release` points to a static NUL-terminated string.
+        let release = unsafe {
+            let mut info = std::mem::zeroed::<ErlNifSysInfo>();
+            enif_system_info(&mut info, std::mem::size_of::<ErlNifSysInfo>());
+            if info.otp_release.is_null() {
+                return false;
+            }
+            std::ffi::CStr::from_ptr(info.otp_release).to_bytes()
+        };
+        std::str::from_utf8(release)
+            .ok()
+            .and_then(|r| r.parse::<u32>().ok())
+            .is_some_and(|r| r >= 27)
+    })
 }
 
 /// Below this, ERTS's sort is cheaper than checking the order ourselves.
@@ -277,17 +300,24 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     /// Only borrowed keys qualify: an escaped key's bytes live in the parser's
     /// scratch buffer, which later strings overwrite, so its pointer can't be
     /// used as a cache identity. Those (rare) keys fall back to `str_term`.
-    /// `wide` says the key starts at least 8 bytes before the end of the input,
-    /// so `prefix` came from one unaligned load; a key inside the final 8 bytes
-    /// of the document (impossible in valid JSON, which needs at least `":x}`
-    /// after it) just falls back.
+    /// `wide` is the key's offset in the input when it starts at least 8 bytes
+    /// before the end, so `prefix` came from one unaligned load; a key inside
+    /// the final 8 bytes of the document (impossible in valid JSON, which needs
+    /// at least `":x}` after it) just falls back.
     #[inline]
-    fn key_term(&mut self, s: &str, wide: bool, prefix: u64) -> ERL_NIF_TERM {
+    fn key_term(&mut self, s: &str, wide: Option<usize>, prefix: u64) -> ERL_NIF_TERM {
         let ptr = s.as_ptr();
         let len = s.len();
-        if !wide || self.keys.debit > KEY_CACHE_BYPASS_AT || len == 0 || len > KEY_CACHE_MAX_LEN {
-            return self.str_term(s);
-        }
+        let offset = match wide {
+            Some(offset)
+                if self.keys.debit <= KEY_CACHE_BYPASS_AT
+                    && len != 0
+                    && len <= KEY_CACHE_MAX_LEN =>
+            {
+                offset
+            }
+            _ => return self.str_term(s),
+        };
         // Schema keys often share their first 8 bytes and length
         // (`profile_link_color`, `profile_text_color`), so mix in the last 8
         // too or they evict each other from the same slot.
@@ -297,7 +327,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             0
         };
         let h = (prefix ^ (len as u64) ^ tail.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let entry = &mut self.keys.entries[(h >> 56) as usize & (KEY_CACHE_SLOTS - 1)];
+        let slot = (h >> 56) as usize & (KEY_CACHE_SLOTS - 1);
+        let entry = &self.keys.entries[slot];
         if entry.epoch == self.keys.epoch
             && entry.prefix == prefix
             && entry.tail == tail
@@ -312,11 +343,16 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             return entry.term;
         }
         self.keys.debit += 1;
-        // len <= KEY_CACHE_MAX_LEN (64), so this is an on-heap binary, not refc.
-        let mut binary = NewBinary::new(self.env, len);
-        binary.as_mut_slice().copy_from_slice(s.as_bytes());
-        let term = Term::from(binary).as_c_arg();
-        *entry = KeyEntry {
+        // len <= KEY_CACHE_MAX_LEN (64), so either way this is an on-heap
+        // binary, not refc.
+        let term = if sub_binaries_copy_keys() {
+            unsafe { enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, len) }
+        } else {
+            let mut binary = NewBinary::new(self.env, len);
+            binary.as_mut_slice().copy_from_slice(s.as_bytes());
+            Term::from(binary).as_c_arg()
+        };
+        self.keys.entries[slot] = KeyEntry {
             ptr,
             term,
             prefix,
@@ -524,9 +560,9 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     fn visit_key(&mut self, key: &str) -> bool {
         let len = key.len();
         let offset = self.input.offset_within(key);
-        let wide = matches!(offset, Some(o) if self.input.len - o >= 8);
+        let wide = offset.filter(|&o| self.input.len - o >= 8);
         // First 8 key bytes, little-endian and zero-padded.
-        let prefix = if wide {
+        let prefix = if wide.is_some() {
             let w = unsafe { (key.as_ptr() as *const u64).read_unaligned() };
             if len < 8 {
                 w & ((1u64 << (len * 8)) - 1)
