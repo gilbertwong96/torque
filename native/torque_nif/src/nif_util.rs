@@ -66,8 +66,14 @@ pub unsafe fn map_from_arrays(
 
 /// Build a map from an object's keys and values. Duplicate keys fall back to
 /// inserting the members in order, so the last value for a key wins.
+///
+/// Up to one member, a put into an empty map skips the heap factory that
+/// `enif_make_map_from_arrays` sets up and closes around every map.
 #[inline]
 pub fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+    if keys.len() <= 1 {
+        return map_last_wins(env, keys, vals);
+    }
     try_make_map(env, keys, vals).unwrap_or_else(|| map_last_wins(env, keys, vals))
 }
 
