@@ -1,4 +1,4 @@
-# Vendored copy of sonic-rs 0.5.8 with a minimal Torque patch:
+# Vendored copy of sonic-rs 0.5.10 with a minimal Torque patch:
 #   * `JsonVisitor` made public + re-exported
 #   * `parse_into_visitor` entry added, so Torque can build Erlang terms
 #     directly during the native SIMD parse (one pass, zero-copy strings)
@@ -40,7 +40,7 @@
 [package]
 edition = "2021"
 name = "sonic-rs"
-version = "0.5.8"
+version = "0.5.10"
 authors = ["Volo Team <volo@cloudwego.io>"]
 build = false
 autobins = false

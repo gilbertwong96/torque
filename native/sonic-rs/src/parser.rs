@@ -10,7 +10,7 @@ use std::{
 
 use faststr::FastStr;
 use serde::de::{self, Expected, Unexpected};
-use sonic_number::{parse_number, ParserNumber};
+use sonic_number::{parse_float32, parse_number, ParserNumber};
 #[cfg(all(target_feature = "neon", target_arch = "aarch64"))]
 use sonic_simd::bits::NeonBits;
 use sonic_simd::{i8x32, m8x32, u8x32, u8x64, Mask, Simd};
@@ -348,6 +348,31 @@ where
         Err(err)
     }
 
+    #[inline(always)]
+    pub fn parse_float32(&mut self, first: u8) -> Result<f32> {
+        let reader = &mut self.read;
+        let neg = first == b'-';
+        let mut now = reader.index() - (!neg as usize);
+        let data = reader.as_u8_slice();
+        let ret = parse_float32(data, &mut now, neg);
+        reader.set_index(now);
+        ret.map_err(|err| self.error(err.into()))
+    }
+
+    /// Unchecked number parsing — requires padded buffer (PaddedSliceRead).
+    /// Uses the full padded buffer (including padding) so unchecked access is safe.
+    #[inline(always)]
+    pub fn parse_number_unchecked(&mut self, first: u8) -> Result<ParserNumber> {
+        let reader = &mut self.read;
+        let neg = first == b'-';
+        let mut now = reader.index() - (!neg as usize);
+        // Use padded_slice which includes the padding bytes, so unchecked reads are safe.
+        let data = reader.padded_slice();
+        let ret = unsafe { sonic_number::parse_number_unchecked(data, &mut now, neg) };
+        reader.set_index(now);
+        ret.map_err(|err| self.error(err.into()))
+    }
+
     /// Parse a JSON string and visit it.
     /// When `strbuf` is Some, copies into the buffer (owned, calls visit_str).
     /// When `strbuf` is None, parses inplace zero-copy (calls visit_borrowed_str).
@@ -391,6 +416,41 @@ where
         }
     }
 
+    /// Fast path for keys that terminate within 24 bytes and contain no escapes (`\\`)
+    /// or control characters (`< 0x20`). Accepts any valid UTF-8 bytes (including
+    /// multi-byte sequences). Falls back to `parse_string_visit` on escape, control
+    /// byte, or if no closing `"` is found within 24 bytes.
+    ///
+    /// # Safety
+    /// Only called when strbuf=None (padded reader path). PaddedSliceRead has 64 bytes
+    /// of zero-padding beyond valid JSON, so scanning 24 bytes ahead is always safe.
+    /// Padding bytes (0x00) are < 0x20 and will bail to parse_string_visit.
+    #[inline(always)]
+    fn parse_key_scalar<V>(&mut self, vis: &mut V) -> Result<()>
+    where
+        V: JsonVisitor<'de>,
+    {
+        unsafe {
+            let mut p = self.read.cur_ptr();
+            let start = p;
+            let end = p.add(24);
+            while p < end {
+                let ch = *p;
+                if ch == b'"' {
+                    let len = p.offset_from(start) as usize;
+                    self.read.set_ptr(p.add(1));
+                    let s = std::str::from_utf8_unchecked(std::slice::from_raw_parts(start, len));
+                    return check_visit!(self, vis.visit_borrowed_key(s));
+                }
+                if ch == b'\\' || ch < 0x20 {
+                    return self.parse_string_visit(vis, None, true);
+                }
+                p = p.add(1);
+            }
+            self.parse_string_visit(vis, None, true)
+        }
+    }
+
     /// Parse a number. When `inplace` is true, visits as borrowed raw number.
     #[inline(always)]
     fn parse_number_visit<V>(&mut self, first: u8, vis: &mut V, inplace: bool) -> Result<()>
@@ -409,7 +469,13 @@ where
             check_visit!(self, ok)
         } else {
             let start = self.read.index() - 1;
-            let number = match self.parse_number(first) {
+            // When inplace=true, buffer has >=64 bytes padding — safe for unchecked.
+            let parsed = if inplace {
+                self.parse_number_unchecked(first)
+            } else {
+                self.parse_number(first)
+            };
+            let number = match parsed {
                 Ok(number) => number,
                 Err(err) => {
                     let raw = self.huge_int(start, first, err)?;
@@ -460,6 +526,21 @@ where
         loop {
             self.dispatch_value(first, vis, &mut strbuf, depth + 1)?;
             count += 1;
+            // Compact: u16 read for single-instruction matching
+            let sep = self.read.peek_u16();
+            if (sep & 0xFF) == b',' as u16 {
+                let val_ch = (sep >> 8) as u8;
+                if !is_whitespace(val_ch) {
+                    self.read.eat(2);
+                    first = Some(val_ch);
+                    continue;
+                }
+            }
+            if (sep & 0xFF) == b']' as u16 {
+                self.read.eat(1);
+                return check_visit!(self, vis.visit_array_end(count));
+            }
+            // Slow path
             first = match self.skip_space() {
                 Some(b']') => return check_visit!(self, vis.visit_array_end(count)),
                 Some(b',') => self.skip_space(),
@@ -489,11 +570,46 @@ where
         }
 
         loop {
-            self.parse_string_visit(vis, strbuf.as_deref_mut(), true)?;
-            self.parse_object_clo()?;
-            let next = self.skip_space();
+            // ---- parse key (scalar fast path for short ASCII keys) ----
+            if strbuf.is_none() {
+                self.parse_key_scalar(vis)?;
+            } else {
+                self.parse_string_visit(vis, strbuf.as_deref_mut(), true)?;
+            }
+
+            // ---- find ':' + value start byte ----
+            // Use u16 read: on little-endian, ':' followed by val_ch = (val_ch << 8) | ':'
+            let pair = self.read.peek_u16();
+            let next = if (pair & 0xFF) == b':' as u16 {
+                let val_ch = (pair >> 8) as u8;
+                if !is_whitespace(val_ch) {
+                    self.read.eat(2);
+                    Some(val_ch)
+                } else {
+                    self.parse_object_clo()?;
+                    self.skip_space()
+                }
+            } else {
+                self.parse_object_clo()?;
+                self.skip_space()
+            };
+
+            // ---- parse value ----
             self.dispatch_value(next, vis, &mut strbuf, depth + 1)?;
             count += 1;
+
+            // ---- find separator: one u16 read to match `,"` or `}x` ----
+            let sep = self.read.peek_u16();
+            // Little-endian: `,"` = 0x222C, `}x` = (x << 8) | 0x7D
+            if sep == u16::from_le_bytes(*b",\"") {
+                self.read.eat(2);
+                continue;
+            }
+            if (sep & 0xFF) == b'}' as u16 {
+                self.read.eat(1);
+                return check_visit!(self, vis.visit_object_end(count));
+            }
+            // Slow path
             match self.skip_space() {
                 Some(b'}') => return check_visit!(self, vis.visit_object_end(count)),
                 Some(b',') => match self.skip_space() {
@@ -1427,7 +1543,7 @@ where
 
     #[inline(always)]
     fn skip_number_unsafe(&mut self) -> Result<()> {
-        let _ = self.get_next_token([b']', b'}', b','], 0);
+        let _ = self.get_next_token(*b"]},", 0);
         Ok(())
     }
 
@@ -1686,7 +1802,7 @@ where
         }
 
         // deal with the empty object
-        match self.get_next_token([b'"', b'}'], 1) {
+        match self.get_next_token(*b"\"}", 1) {
             Some(b'"') => {}
             Some(b'}') => return perr!(self, GetInEmptyObject),
             None => return perr!(self, EofWhileParsing),
@@ -1723,7 +1839,7 @@ where
                     _ => {}
                 };
                 // optimize: direct find the next quote of key or object ending
-                match self.get_next_token([b'"', b'}'], 1) {
+                match self.get_next_token(*b"\"}", 1) {
                     Some(b'"') => continue,
                     Some(b'}') => return perr!(self, GetUnknownKeyInObject),
                     None => return perr!(self, EofWhileParsing),
@@ -1779,7 +1895,7 @@ where
                     _ => {}
                 };
                 // optimize: direct find the next token
-                match self.get_next_token([b']', b','], 1) {
+                match self.get_next_token(*b"],", 1) {
                     Some(b']') => return perr!(self, GetIndexOutOfArray),
                     Some(b',') => {
                         count -= 1;
@@ -1864,7 +1980,6 @@ where
     }
 
     #[allow(clippy::mutable_key_type)]
-    #[allow(clippy::mutable_key_type)]
     fn get_many_keys(
         &mut self,
         mkeys: &MultiKey,
@@ -1888,7 +2003,7 @@ where
                 _ => return perr!(self, ExpectObjectKeyOrEnd),
             }
         } else {
-            match self.get_next_token([b'"', b'}'], 1) {
+            match self.get_next_token(*b"\"}", 1) {
                 Some(b'"') => {}
                 Some(b'}') => return perr!(self, GetInEmptyObject),
                 None => return perr!(self, EofWhileParsing),
@@ -1929,7 +2044,7 @@ where
                 }
             } else {
                 // optimize: direct find the next quote of key. or object ending
-                match self.get_next_token([b'"', b'}'], 1) {
+                match self.get_next_token(*b"\"}", 1) {
                     Some(b'"') => {}
                     Some(b'}') => break,
                     None => return perr!(self, EofWhileParsing),
@@ -2011,7 +2126,7 @@ where
                 }
             } else {
                 // optimize: direct find the next token
-                match self.get_next_token([b']', b','], 1) {
+                match self.get_next_token(*b"],", 1) {
                     Some(b']') => break,
                     Some(b',') => {
                         index += 1;

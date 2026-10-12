@@ -49,6 +49,23 @@ pub trait Reader<'de>: Sealed {
     fn set_index(&mut self, index: usize);
     fn next_n(&mut self, n: usize) -> Option<&'de [u8]>;
 
+    /// Return the full buffer including padding. For unchecked number parsing.
+    /// Default: same as as_u8_slice (no padding). PaddedSliceRead overrides.
+    fn padded_slice(&self) -> &'de [u8] {
+        self.as_u8_slice()
+    }
+
+    /// Peek next 2 bytes as a little-endian u16 for single-instruction matching.
+    /// E.g., `peek_u16() == u16::from_le_bytes([b',', b'"'])` matches `,"` in one cmp.
+    /// Returns 0 if fewer than 2 bytes remain (0 won't match any structural char).
+    #[inline(always)]
+    fn peek_u16(&self) -> u16 {
+        match self.peek_n(2) {
+            Some(s) => u16::from_le(unsafe { (s.as_ptr() as *const u16).read_unaligned() }),
+            None => 0,
+        }
+    }
+
     #[inline(always)]
     fn next(&mut self) -> Option<u8> {
         self.peek().inspect(|_| {
@@ -320,6 +337,12 @@ impl<'a> Reader<'a> for PaddedSliceRead<'a> {
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 
+    /// Return full buffer including padding (len + PADDING_SIZE bytes).
+    /// Safe for unchecked digit reads that may overshoot by up to 64 bytes.
+    fn padded_slice(&self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len + Self::PADDING_SIZE) }
+    }
+
     #[inline(always)]
     fn slice_ref(&self, subset: &'a [u8]) -> JsonSlice<'a> {
         subset.into()
@@ -335,6 +358,11 @@ impl<'a> Reader<'a> for PaddedSliceRead<'a> {
     fn peek_n(&self, n: usize) -> Option<&'a [u8]> {
         debug_assert!(self.index() + n <= self.len + Self::PADDING_SIZE);
         unsafe { Some(std::slice::from_raw_parts(self.cur.as_ptr(), n)) }
+    }
+
+    #[inline(always)]
+    fn peek_u16(&self) -> u16 {
+        u16::from_le(unsafe { (self.cur.as_ptr() as *const u16).read_unaligned() })
     }
 
     #[inline(always)]
