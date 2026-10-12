@@ -10,8 +10,9 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_sub_binary,
-    enif_make_uint64, enif_system_info, ErlNifSysInfo, ERL_NIF_TERM,
+    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
+    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, enif_system_info, ErlNifSysInfo,
+    ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::JsonVisitor;
@@ -241,6 +242,7 @@ pub(crate) struct TermBuilder<'a, 'b> {
     keys: &'b mut KeyCache,
     /// The term JSON null becomes.
     null: ERL_NIF_TERM,
+    empty_map: ERL_NIF_TERM,
     too_deep: bool,
 }
 
@@ -269,6 +271,27 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     #[inline]
     pub(crate) fn set_strings(&mut self, strings: Strings) {
         self.strings = strings;
+    }
+
+    /// This call's empty map, shared by every `{}` in the document.
+    #[inline]
+    fn empty_map(&mut self) -> ERL_NIF_TERM {
+        if self.empty_map == 0 {
+            self.empty_map = unsafe { enif_make_new_map(self.env.as_c_arg()) };
+        }
+        self.empty_map
+    }
+
+    /// Map of a single member. `enif_make_map_from_arrays` sets up and closes
+    /// a heap factory around every map, which costs more than building a
+    /// one-member map; putting the member into an empty map is a single
+    /// `HAlloc`. With more members the puts compare keys and leave garbage.
+    #[inline]
+    fn map_of_one(&mut self, key: ERL_NIF_TERM, value: ERL_NIF_TERM) -> ERL_NIF_TERM {
+        let empty = self.empty_map();
+        let mut map = 0;
+        unsafe { enif_make_map_put(self.env.as_c_arg(), empty, key, value, &mut map) };
+        map
     }
 
     #[inline]
@@ -637,13 +660,19 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             None => return false,
         };
         let start = frame.values;
-        let keys = &self.key_terms[frame.ords..];
-        let vals = &self.values[start..];
-        let map = match build_map(self.env, keys, vals, &self.ords[frame.ords..]) {
-            Some(map) => map,
-            None => {
-                self.dropped_members = true;
-                map_last_wins(self.env, keys, vals)
+        let map = match self.key_terms.len() - frame.ords {
+            0 => self.empty_map(),
+            1 => self.map_of_one(self.key_terms[frame.ords], self.values[start]),
+            _ => {
+                let keys = &self.key_terms[frame.ords..];
+                let vals = &self.values[start..];
+                match build_map(self.env, keys, vals, &self.ords[frame.ords..]) {
+                    Some(map) => map,
+                    None => {
+                        self.dropped_members = true;
+                        map_last_wins(self.env, keys, vals)
+                    }
+                }
             }
         };
         self.key_terms.truncate(frame.ords);
@@ -700,6 +729,7 @@ pub(crate) fn with_term_builder<'a, R>(
             ords,
             keys,
             null,
+            empty_map: 0,
             too_deep: false,
         };
         let result = f(&mut builder);
