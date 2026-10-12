@@ -1,6 +1,6 @@
 {application, torque, [
     {description, "High-performance JSON library via Rustler NIFs (sonic-rs)"},
-    {vsn, "0.5.1"},
+    {vsn, "0.5.2"},
     {registered, []},
     {applications, [kernel, stdlib]},
     {env, []},
