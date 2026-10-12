@@ -178,6 +178,21 @@ defmodule Torque.DecodeTest do
       assert Enum.all?(decoded, &(&1 == expected))
     end
 
+    # On OTP 27 :binary.referenced_byte_size/1 reports a heap binary's size in
+    # bits, so compare against the input rather than the key.
+    test "cached keys never reference the input" do
+      keys = ["k", String.duplicate("m", 16), String.duplicate("l", 64)]
+      record = "{" <> Enum.map_join(keys, ",", &~s("#{&1}":1)) <> "}"
+      json = "[" <> record <> "," <> record <> "]"
+
+      for opts <- [[], [strings: :copy]] do
+        decoded = Torque.decode!(json, opts)
+        decoded_keys = Enum.flat_map(decoded, &Map.keys/1)
+        assert Enum.sort(decoded_keys) == Enum.sort(keys ++ keys)
+        refute Enum.any?(decoded_keys, &(:binary.referenced_byte_size(&1) == byte_size(json)))
+      end
+    end
+
     test "invalid json returns error" do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end
