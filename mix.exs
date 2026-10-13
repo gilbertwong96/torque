@@ -30,7 +30,7 @@ end
 defmodule Torque.MixProject do
   use Mix.Project
 
-  @version "0.5.2"
+  @version "0.5.3"
   @source_url "https://github.com/lpgauth/torque"
 
   def project do
