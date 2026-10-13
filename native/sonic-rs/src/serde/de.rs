@@ -537,7 +537,28 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
     impl_deserialize_number!(deserialize_u16);
     impl_deserialize_number!(deserialize_u32);
     impl_deserialize_number!(deserialize_u64);
-    impl_deserialize_number!(deserialize_f32);
+    /// Deserialize f32 using a dedicated single-pass parser to avoid both
+    /// the f64→f32 rounding pitfall and the extra fallback parse.
+    ///
+    /// The f64→f32 cast can produce an off-by-one ULP error when the original
+    /// decimal is at a tie-breaking boundary (e.g., "17005001.000000000000130").
+    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        let Some(peek) = self.parser.skip_space() else {
+            return Err(self.parser.error(EofWhileParsing));
+        };
+
+        let value = match peek {
+            c @ b'-' | c @ b'0'..=b'9' => {
+                let f = tri!(self.parser.parse_float32(c));
+                visitor.visit_f32(f)
+            }
+            _ => Err(self.peek_invalid_type(peek, &visitor)),
+        };
+        self.fix_position(value)
+    }
     impl_deserialize_number!(deserialize_f64);
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
@@ -1172,7 +1193,7 @@ where
     deserialize_numeric_key!(deserialize_u32);
     deserialize_numeric_key!(deserialize_u64);
     deserialize_numeric_key!(deserialize_u128, deserialize_u128);
-    deserialize_numeric_key!(deserialize_f32);
+    deserialize_numeric_key!(deserialize_f32, deserialize_f32);
     deserialize_numeric_key!(deserialize_f64);
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>

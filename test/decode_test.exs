@@ -193,6 +193,20 @@ defmodule Torque.DecodeTest do
       end
     end
 
+    # parse/1 scans keys of up to 24 bytes without the string parser, so cover
+    # keys on either side of that, with and without input after them.
+    test "invalid UTF-8 in a key is rejected" do
+      tail = String.duplicate(" ", 40)
+
+      for key <- [<<"a", 0xFF, "b">>, <<String.duplicate("k", 30)::binary, 0xFF>>],
+          pad <- ["", tail] do
+        json = ~s({"#{key}":1}) <> pad
+        assert {:error, message} = Torque.decode(json)
+        assert message =~ "Invalid UTF-8"
+        assert {:error, _} = Torque.parse(json)
+      end
+    end
+
     test "invalid json returns error" do
       assert {:error, _reason} = Torque.decode("{invalid}")
     end

@@ -16,9 +16,9 @@ defmodule Torque do
       values only where a path ends and skipping everything else. For one-shot
       extraction — parse a payload, take a few fields, discard it — prefer this
       over `parse/2` + `get/2`: it never builds the document it is about to
-      throw away. Measured, it is never slower, and anywhere from parity to
-      several times faster depending on the document's size and the CPU. The
-      bigger lever on large documents is `validate: false` on the handle, but
+      throw away. Measured, it is several times faster on a small document;
+      on a large one it depends on the CPU, still well ahead on x86 but about
+      15% behind `parse/2` + `get_many_nil/2` on an Apple M1. The bigger lever on large documents is `validate: false` on the handle, but
       read its note in `compile_pointers/2` first: it is only a win when the
       paths select a small part of the document. The README has measured
       figures.
@@ -552,8 +552,8 @@ defmodule Torque do
   More efficient than calling `get/2` in a loop because it crosses
   the NIF boundary only once. For a request-shaped document you query once and
   then discard, `compile_pointers/2` + `parse_get_many_nil/2` is usually faster
-  still, since it never builds the document at all, though that advantage
-  narrows to nothing as the document grows.
+  still, since it never builds the document at all, though on a large document
+  `parse/2` can come out ahead (the README has measured figures).
 
   Raises `ArgumentError` if any path is not a valid UTF-8 binary. A malformed
   pointer gives `{:error, :no_such_field}`, as in `get/2`.

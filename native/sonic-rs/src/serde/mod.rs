@@ -577,6 +577,28 @@ mod test {
         test_from!(BTreeMap<Float, String>, from_str, "{\"1.23\":null}" );
     }
 
+    #[test]
+    fn test_deserialize_f32_single_pass_precision() {
+        let input = "17005001.000000000000130";
+        let got: f32 = crate::from_str(input).unwrap();
+        let expect: f32 = input.parse().unwrap();
+        assert_eq!(got.to_bits(), expect.to_bits());
+
+        let input = "100e11";
+        let got: f32 = crate::from_str(input).unwrap();
+        let expect: f32 = input.parse().unwrap();
+        assert_eq!(got.to_bits(), expect.to_bits());
+
+        let input = "-0";
+        let got: f32 = crate::from_str(input).unwrap();
+        let expect: f32 = input.parse().unwrap();
+        assert_eq!(got.to_bits(), expect.to_bits());
+
+        let err = crate::from_str::<f32>("1e39").unwrap_err();
+        assert!(err.is_syntax());
+        assert!(err.to_string().to_lowercase().contains("finite"));
+    }
+
     // test deserialize into different mapkeys
     #[derive(PartialEq, Debug)]
     struct MapKeys<'a> {
@@ -784,6 +806,11 @@ mod test {
             value: f64,
         }
 
+        #[derive(Serialize)]
+        struct Float32Test {
+            value: f32,
+        }
+
         let test = FloatTest { value: 18.0 };
         let json = to_string(&test).unwrap();
 
@@ -796,5 +823,28 @@ mod test {
         let test = FloatTest { value: 18.1 };
         let json = to_string(&test).unwrap();
         assert_eq!(json, r#"{"value":18.1}"#);
+
+        let test = FloatTest {
+            value: ((1u64 << 54) as f64) + 8.0,
+        };
+        let json = to_string(&test).unwrap();
+        assert_eq!(json, r#"{"value":1.801439850948199e+16}"#);
+
+        let test = Float32Test { value: 1.342178e8 };
+        let json = to_string(&test).unwrap();
+
+        #[cfg(feature = "non_trailing_zero")]
+        assert_eq!(json, r#"{"value":134217800}"#);
+
+        #[cfg(not(feature = "non_trailing_zero"))]
+        assert_eq!(json, r#"{"value":134217800.0}"#);
+
+        let test = Float32Test { value: 1e20 };
+        let json = to_string(&test).unwrap();
+        assert_eq!(json, r#"{"value":1e+20}"#);
+
+        let test = Float32Test { value: 18.25 };
+        let json = to_string(&test).unwrap();
+        assert_eq!(json, r#"{"value":18.25}"#);
     }
 }

@@ -103,9 +103,12 @@ everything else, without building an intermediate document. Against
 
 | | arm64 (M1 Pro) | x86_64 (Xeon E5-2630 v3) |
 |---|---|---|
-| 1.2 KB bid request, all 51 fields | ~3× faster | ~3.6× faster |
-| 1.2 KB bid request, 3 fields | ~1.3× faster | ~3× faster |
-| 776 KB feed, 3 fields | parity | ~3.2× faster |
+| 1.2 KB bid request, all 51 fields | ~2.3× faster | ~2.8× faster |
+| 1.2 KB bid request, 3 fields | ~1.2× faster | ~2× faster |
+| 776 KB feed, 3 fields | ~15% slower | ~2.4× faster |
+
+On arm64 `parse/2` builds a large document fast enough that the single pass
+loses to it; on x86 the single pass wins at every size.
 
 ```elixir
 # Once, at startup (e.g. into :persistent_term or application state; the
@@ -463,15 +466,15 @@ the 750 KB one below is decoded JSON, so its keys are binaries.
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse | **616.3K** | **1.62 μs** | **1.29 μs** | **2.83 μs** |
-| **torque** parse(unique_keys) | 597.1K | 1.67 μs | 1.33 μs | 3.08 μs |
+| **torque** parse | **740.8K** | **1.35 μs** | **0.96 μs** | 2.79 μs |
+| **torque** parse(unique_keys) | 736.7K | 1.36 μs | 1.00 μs | **2.71 μs** |
 
 **x86_64**
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse | **243.3K** | **4.11 μs** | **3.31 μs** | 6.96 μs |
-| **torque** parse(unique_keys) | 232.6K | 4.30 μs | 3.43 μs | **6.48 μs** |
+| **torque** parse | **289.2K** | **3.46 μs** | **2.67 μs** | 6.39 μs |
+| **torque** parse(unique_keys) | 278.4K | 3.59 μs | 2.78 μs | **5.89 μs** |
 
 ### Extract 5 fields from raw JSON (1.2 KB OpenRTB)
 
@@ -490,24 +493,24 @@ a document this small is most of what is left.
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse_get_many_nil unique_keys validate: false | **1339K** | **0.75 μs** | **0.71 μs** | **0.83 μs** |
-| **torque** parse_get_many_nil unique_keys | 713.4K | 1.40 μs | 1.38 μs | 1.50 μs |
-| **torque** parse_get_many_nil | 709.8K | 1.41 μs | 1.38 μs | 1.54 μs |
-| **torque** parse(unique_keys) + get_many | 514.8K | 1.94 μs | 1.75 μs | 3.29 μs |
-| **torque** parse + get x5 | 486.6K | 2.05 μs | 1.83 μs | 3.79 μs |
-| **torque** parse + get_many | 485.5K | 2.06 μs | 1.71 μs | 3.33 μs |
+| **torque** parse_get_many_nil unique_keys validate: false | **1295K** | **0.77 μs** | **0.75 μs** | **0.88 μs** |
+| **torque** parse_get_many_nil | 689.5K | 1.45 μs | 1.42 μs | 1.63 μs |
+| **torque** parse_get_many_nil unique_keys | 686.9K | 1.46 μs | 1.42 μs | 1.63 μs |
+| **torque** parse(unique_keys) + get_many | 591.6K | 1.69 μs | 1.46 μs | 3.58 μs |
+| **torque** parse + get x5 | 559.1K | 1.79 μs | 1.54 μs | 3.63 μs |
+| **torque** parse + get_many | 547.8K | 1.83 μs | 1.42 μs | 3.88 μs |
 | **glazer** decode + find x5 | 316.4K | 3.16 μs | 3.08 μs | 4.04 μs |
 
 **x86_64**
 
 | Library | ips | mean | median | p99 |
 |---|---|---|---|---|
-| **torque** parse_get_many_nil unique_keys validate: false | **917.7K** | **1.09 μs** | **1.00 μs** | **1.63 μs** |
-| **torque** parse_get_many_nil | 532.9K | 1.88 μs | 1.78 μs | 2.41 μs |
-| **torque** parse_get_many_nil unique_keys | 532.8K | 1.88 μs | 1.77 μs | 2.42 μs |
-| **torque** parse(unique_keys) + get_many | 206.7K | 4.84 μs | 3.96 μs | 12.93 μs |
-| **torque** parse + get x5 | 204.5K | 4.89 μs | 4.22 μs | 9.29 μs |
-| **torque** parse + get_many | 198.0K | 5.05 μs | 3.88 μs | 8.12 μs |
+| **torque** parse_get_many_nil unique_keys validate: false | **939.6K** | **1.06 μs** | **0.97 μs** | **1.64 μs** |
+| **torque** parse_get_many_nil | 534.0K | 1.87 μs | 1.77 μs | 2.43 μs |
+| **torque** parse_get_many_nil unique_keys | 527.4K | 1.90 μs | 1.78 μs | 2.50 μs |
+| **torque** parse(unique_keys) + get_many | 243.3K | 4.11 μs | 3.25 μs | 12.78 μs |
+| **torque** parse + get_many | 233.9K | 4.28 μs | 3.25 μs | 6.81 μs |
+| **torque** parse + get x5 | 232.3K | 4.30 μs | 3.63 μs | 8.40 μs |
 | **glazer** decode + find x5 | 149.9K | 6.67 μs | 6.45 μs | 10.81 μs |
 
 Run benchmarks locally:
