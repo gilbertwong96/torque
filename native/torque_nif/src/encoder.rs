@@ -1,4 +1,5 @@
 use crate::atoms;
+use crate::escape::InvalidUtf8;
 use crate::nif_util::{make_tuple2, timeslice_percent, MapEntries};
 use crate::types::MAX_DEPTH;
 use rustler::sys::{
@@ -132,6 +133,12 @@ enum EncodeError {
     DepthExceeded,
     InvalidUtf8,
     UnhandledStruct,
+}
+
+impl From<InvalidUtf8> for EncodeError {
+    fn from(_: InvalidUtf8) -> Self {
+        EncodeError::InvalidUtf8
+    }
 }
 
 #[inline]
@@ -427,8 +434,7 @@ fn encode_map_key(env_raw: *mut ErlNifEnv, key: Term, s: &mut Scratch) -> Result
             let bin = bin.assume_init();
             std::slice::from_raw_parts(bin.data, bin.size)
         };
-        return crate::escape::write_json_string(slice, &mut s.buf)
-            .map_err(|_| EncodeError::InvalidUtf8);
+        return Ok(crate::escape::write_json_string(slice, &mut s.buf)?);
     }
     match key.get_type() {
         TermType::Atom => s.names.write(env_raw, raw, &mut s.buf),
@@ -491,8 +497,7 @@ fn encode_binary(
         let bin = bin.assume_init();
         std::slice::from_raw_parts(bin.data, bin.size)
     };
-    crate::escape::write_json_string(slice, buf).map_err(|_| EncodeError::InvalidUtf8)?;
-    Ok(())
+    Ok(crate::escape::write_json_string(slice, buf)?)
 }
 
 #[inline]

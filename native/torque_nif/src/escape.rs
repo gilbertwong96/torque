@@ -71,6 +71,10 @@ const fn build_needs_escape() -> [bool; 256] {
 
 static NEEDS_ESCAPE: [bool; 256] = build_needs_escape();
 
+/// A string handed to the validating kernels is not UTF-8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvalidUtf8;
+
 // ---------------------------------------------------------------------------
 // Short-string fast path
 // ---------------------------------------------------------------------------
@@ -132,34 +136,34 @@ unsafe fn escape_prefix(src: *const u8, len: usize, dst: *mut u8) -> usize {
 // ---------------------------------------------------------------------------
 
 #[inline]
-unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<usize, ()> {
+unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<usize, InvalidUtf8> {
     let b0 = *src.add(pos);
     let width = match b0 {
         0xC2..=0xDF => 2,
         0xE0..=0xEF => 3,
         0xF0..=0xF4 => 4,
-        _ => return Err(()), // 0x80-0xC1 or 0xF5-0xFF
+        _ => return Err(InvalidUtf8), // 0x80-0xC1 or 0xF5-0xFF
     };
     if pos + width > len {
-        return Err(());
+        return Err(InvalidUtf8);
     }
     match width {
         2 => {
             if *src.add(pos + 1) & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         3 => {
             let b1 = *src.add(pos + 1);
             let b2 = *src.add(pos + 2);
             if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xE0 && b1 < 0xA0 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xED && b1 >= 0xA0 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         4 => {
@@ -167,13 +171,13 @@ unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<us
             let b2 = *src.add(pos + 2);
             let b3 = *src.add(pos + 3);
             if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 || b3 & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xF0 && b1 < 0x90 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xF4 && b1 >= 0x90 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         _ => unreachable!(),
@@ -418,10 +422,10 @@ unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
 
 /// Appends `bytes` as a quoted, escaped JSON string.
 ///
-/// Returns `Err(())` for invalid UTF-8. Capacity for the maximum expansion is
+/// Returns `Err(InvalidUtf8)` for invalid UTF-8. Capacity for the maximum expansion is
 /// reserved before writing through the vector's spare capacity.
 #[inline]
-pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), ()> {
+pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), InvalidUtf8> {
     let len = bytes.len();
     buf.reserve(len * 6 + 34);
     let base = buf.len();
@@ -455,7 +459,11 @@ pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), (
 /// bytes; escapes overrun what they keep, but not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_neon(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::aarch64::*;
 
     let thresh = vdupq_n_u8(0x20);
@@ -514,7 +522,11 @@ unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Resu
 /// not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_avx2(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::x86_64::*;
 
     let thresh = _mm256_set1_epi8(0x20u8 as i8);
@@ -581,7 +593,11 @@ unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Resu
 /// bytes; escapes overrun what they keep, but not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_sse2(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::x86_64::*;
 
     let thresh = _mm_set1_epi8(0x20u8 as i8);
@@ -643,10 +659,10 @@ unsafe fn finish_non_ascii(
     len: usize,
     dst: *mut u8,
     out_pos: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, InvalidUtf8> {
     let rest = std::slice::from_raw_parts(src.add(in_pos), len - in_pos);
     if simdutf8::basic::from_utf8(rest).is_err() {
-        return Err(());
+        return Err(InvalidUtf8);
     }
     Ok(out_pos + escape_dispatch(rest.as_ptr(), rest.len(), dst.add(out_pos)))
 }
@@ -655,7 +671,11 @@ unsafe fn finish_non_ascii(
 // Scalar — validating
 // ---------------------------------------------------------------------------
 
-unsafe fn validate_escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_scalar(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
     let mut start = 0usize;
@@ -703,7 +723,11 @@ unsafe fn validate_escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> Re
 // Dispatch — validating
 // ---------------------------------------------------------------------------
 
-unsafe fn validate_escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_dispatch(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     #[cfg(target_arch = "aarch64")]
     {
         validate_escape_neon(src, len, dst)
@@ -831,7 +855,7 @@ mod tests {
         use super::super::*;
 
         type Escape = unsafe fn(*const u8, usize, *mut u8) -> usize;
-        type Validate = unsafe fn(*const u8, usize, *mut u8) -> Result<usize, ()>;
+        type Validate = unsafe fn(*const u8, usize, *mut u8) -> Result<usize, InvalidUtf8>;
 
         fn escape_with(kernel: Escape, input: &[u8]) -> Vec<u8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
@@ -840,7 +864,7 @@ mod tests {
             dst
         }
 
-        fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, ()> {
+        fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, InvalidUtf8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
             let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr())? };
             dst.truncate(n);
