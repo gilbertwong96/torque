@@ -45,7 +45,7 @@ pub fn value_to_term<'a>(
 ) -> Option<Term<'a>> {
     match value.get_type() {
         JsonType::Null => Some(unsafe { Term::new(env, null) }),
-        JsonType::Boolean => Some(if value.as_bool().unwrap() {
+        JsonType::Boolean => Some(if value.as_bool().expect("get_type() said Boolean") {
             atoms::r#true().to_term(env)
         } else {
             atoms::r#false().to_term(env)
@@ -66,12 +66,15 @@ pub fn value_to_term<'a>(
                 })
             }
         }
-        JsonType::String => Some(make_binary_term(env, value.as_str().unwrap())),
+        JsonType::String => Some(make_binary_term(
+            env,
+            value.as_str().expect("get_type() said String"),
+        )),
         JsonType::Array => {
             if depth == 0 {
                 return None;
             }
-            let arr: &sonic_rs::Array = value.as_array().unwrap();
+            let arr: &sonic_rs::Array = value.as_array().expect("get_type() said Array");
             let count = arr.len();
             let child_depth = depth - 1;
             *nodes += count;
@@ -108,7 +111,7 @@ pub fn value_to_term<'a>(
             if depth == 0 {
                 return None;
             }
-            let obj: &sonic_rs::Object = value.as_object().unwrap();
+            let obj: &sonic_rs::Object = value.as_object().expect("get_type() said Object");
             let count = obj.len();
             let child_depth = depth - 1;
             *nodes += 2 * count;

@@ -336,9 +336,9 @@ fn get_many<'a>(
 
 #[rustler::nif]
 fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
-    match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) if value.is_array() => {
-            let len = value.as_array().unwrap().len();
+    match pointer_lookup(&doc.value, path, doc.unique_keys).and_then(|v| v.as_array()) {
+        Some(array) => {
+            let len = array.len();
             unsafe {
                 Term::new(
                     env,
