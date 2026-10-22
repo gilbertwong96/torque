@@ -2,11 +2,12 @@ use crate::atoms;
 use crate::native_decode::{self, builder_error_term, with_term_builder, Strings, TermBuilder};
 use crate::nif_util::{make_list, make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
-use crate::ParsedDocument;
+use crate::{CompiledPaths, ParsedDocument, PathSeg};
 use rustler::sys::{enif_make_list_cell, enif_make_sub_binary, ERL_NIF_TERM};
 use rustler::{
     schedule, Atom, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
+use sonic_rs::extract::{Extracted, Keys, Seg, Validate};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use std::borrow::Cow;
 
@@ -187,7 +188,7 @@ fn do_parse(
     null: Atom,
     missing: Atom,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
-    let value = sonic_rs::from_slice::<sonic_rs::Value>(bytes)?;
+    let value: sonic_rs::Value = sonic_rs::from_slice(bytes)?;
     Ok(ResourceArc::new(ParsedDocument {
         value,
         keys,
@@ -418,8 +419,6 @@ fn decode_strings(copy_strings: bool) -> Strings {
 // `~`-unescape, index-vs-key classification) lets the per-request call skip all
 // per-path string work — roughly halving extraction time — and fusing the parse
 // and the extraction into one NIF call avoids materializing a document handle.
-use crate::{CompiledPaths, PathSeg};
-use sonic_rs::extract::{Keys, Validate};
 
 /// Pre-split a single JSON Pointer into segments. A numeric segment is stored as
 /// `Num`, keeping both the parsed index and the literal key so the lookup can
@@ -489,7 +488,6 @@ fn compile_paths<'a>(
 fn plan_segs(
     segs: &[PathSeg],
 ) -> impl ExactSizeIterator<Item = sonic_rs::extract::Seg<'_>> + use<'_> {
-    use sonic_rs::extract::Seg;
     segs.iter().map(|s| match s {
         PathSeg::Key(k) => Seg::Key(k),
         PathSeg::Num { idx, key } => Seg::Index { idx: *idx, key },
@@ -605,8 +603,6 @@ fn rebuild_copied(
     values: &[Option<sonic_rs::extract::Extracted>],
     builder: &mut TermBuilder,
 ) -> Vec<ERL_NIF_TERM> {
-    use sonic_rs::extract::Extracted;
-
     let mut terms = builder.roots().to_vec();
     builder.set_strings(Strings::Copy);
     for (slot, v) in values.iter().enumerate() {
@@ -638,8 +634,6 @@ fn do_parse_get_many_nil<'a>(
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> Term<'a> {
-    use sonic_rs::extract::Extracted;
-
     with_term_builder(
         env,
         input_term,
