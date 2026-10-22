@@ -26,8 +26,11 @@ impl rustler::Resource for ParsedDocument {}
 /// A single pre-compiled JSON Pointer segment (see `decoder::compile_one`).
 pub enum PathSeg {
     Key(String),
-    // numeric segment: index if container is array, else object key
-    Num { idx: usize, key: String },
+    /// Numeric segment: an index if the container is an array, else an object key.
+    Num {
+        idx: usize,
+        key: String,
+    },
 }
 
 /// Reusable JSON Pointer paths and their extraction policy. `paths` serves

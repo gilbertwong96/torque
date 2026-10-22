@@ -1,13 +1,14 @@
-// SIMD-accelerated JSON string escaping with optional UTF-8 validation.
-//
-// Entry points:
-//   `escape_to_vec(bytes, buf)` — escape only (for known-valid UTF-8, e.g. atom names)
-//   `write_json_string(bytes, buf)` — validate, escape, and add quotes
-//
-// Platform dispatch:
-//   aarch64 → NEON (vmaxvq_u8 / UMAXV, mandatory on AArch64)
-//   x86_64  → AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
-//   other   → scalar fallback
+//! SIMD-accelerated JSON string escaping with optional UTF-8 validation.
+//!
+//! Entry points:
+//! - `escape_to_vec(bytes, buf)`: escape only, for known-valid UTF-8 such as
+//!   atom names
+//! - `write_json_string(bytes, buf)`: validate, escape, and add quotes
+//!
+//! Platform dispatch:
+//! - aarch64: NEON (`vmaxvq_u8` / UMAXV, mandatory on AArch64)
+//! - x86_64: AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
+//! - other: scalar fallback
 
 type QuoteEntry = (u8, [u8; 8]); // (output_len, escape_bytes)
 
