@@ -155,12 +155,19 @@ fn error_reason(e: EncodeError) -> ERL_NIF_TERM {
     }
 }
 
+/// The scheduler an encode runs on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scheduler {
+    Normal,
+    Dirty,
+}
+
 /// Hand the finished scratch buffer to a freshly allocated Erlang binary,
 /// reporting the work to the scheduler only when it's large enough to matter.
 /// Timeslice accounting is skipped on dirty schedulers, where it's meaningless.
 #[inline]
-fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], report_timeslice: bool) -> Term<'a> {
-    if report_timeslice && buf.len() >= TIMESLICE_MIN_BYTES {
+fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], scheduler: Scheduler) -> Term<'a> {
+    if scheduler == Scheduler::Normal && buf.len() >= TIMESLICE_MIN_BYTES {
         schedule::consume_timeslice(env, timeslice_percent(buf.len()));
     }
     let mut binary = NewBinary::new(env, buf.len());
@@ -282,7 +289,7 @@ fn write_atom_name(
 fn encode_impl<'a>(
     env: Env<'a>,
     term: Term<'a>,
-    report_timeslice: bool,
+    scheduler: Scheduler,
     null: ERL_NIF_TERM,
 ) -> Term<'a> {
     let env_raw = env.as_c_arg();
@@ -292,7 +299,7 @@ fn encode_impl<'a>(
         s.null = null;
         let result = match encode_term(env, env_raw, term, s, MAX_DEPTH) {
             Ok(()) => {
-                let bin_term = buf_to_binary(env, &s.buf, report_timeslice);
+                let bin_term = buf_to_binary(env, &s.buf, scheduler);
                 make_tuple2(env, atoms::ok().as_c_arg(), bin_term.as_c_arg())
             }
             Err(e) => make_tuple2(env, atoms::error().as_c_arg(), error_reason(e)),
@@ -306,38 +313,38 @@ fn encode_impl<'a>(
 
 #[rustler::nif]
 fn encode<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_impl(env, term, true, atoms::nil().as_c_arg())
+    encode_impl(env, term, Scheduler::Normal, atoms::nil().as_c_arg())
 }
 
 /// Opt-in dirty variant: output size can't be predicted from the input term
 /// without a full traversal, so large encodes are dispatched by the caller.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_impl(env, term, false, atoms::nil().as_c_arg())
+    encode_impl(env, term, Scheduler::Dirty, atoms::nil().as_c_arg())
 }
 
 /// `encode/1` with the atom that encodes as JSON null chosen by the caller.
 #[rustler::nif]
 fn encode_opts<'a>(env: Env<'a>, term: Term<'a>, null: Atom) -> Term<'a> {
-    encode_impl(env, term, true, null.as_c_arg())
+    encode_impl(env, term, Scheduler::Normal, null.as_c_arg())
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_opts_dirty<'a>(env: Env<'a>, term: Term<'a>, null: Atom) -> Term<'a> {
-    encode_impl(env, term, false, null.as_c_arg())
+    encode_impl(env, term, Scheduler::Dirty, null.as_c_arg())
 }
 
 /// Returns the raw binary on success, raises on error.
 /// Skips the {:ok, binary} tuple wrapping for maximum throughput.
 #[inline]
-fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) -> Term<'a> {
+fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, scheduler: Scheduler) -> Term<'a> {
     let env_raw = env.as_c_arg();
     SCRATCH.with(|cell| {
         let s = &mut *cell.borrow_mut();
         s.buf.clear();
         s.null = atoms::nil().as_c_arg();
         let result = match encode_term(env, env_raw, term, s, MAX_DEPTH) {
-            Ok(()) => buf_to_binary(env, &s.buf, report_timeslice),
+            Ok(()) => buf_to_binary(env, &s.buf, scheduler),
             Err(e) => unsafe {
                 Term::new(
                     env,
@@ -354,12 +361,12 @@ fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, report_timeslice: bool) 
 
 #[rustler::nif]
 fn encode_iodata<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_iodata_impl(env, term, true)
+    encode_iodata_impl(env, term, Scheduler::Normal)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn encode_iodata_dirty<'a>(env: Env<'a>, term: Term<'a>) -> Term<'a> {
-    encode_iodata_impl(env, term, false)
+    encode_iodata_impl(env, term, Scheduler::Dirty)
 }
 
 #[inline]
