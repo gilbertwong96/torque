@@ -1,3 +1,7 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+use sonic_rs::extract::{Keys, Validate};
+
 mod atoms;
 mod decoder;
 mod encoder;
@@ -11,7 +15,7 @@ mod types;
 /// Erlang.
 pub struct ParsedDocument {
     pub value: sonic_rs::Value,
-    pub unique_keys: bool,
+    pub keys: Keys,
     pub null: rustler::Atom,
     pub missing: rustler::Atom,
 }
@@ -22,8 +26,11 @@ impl rustler::Resource for ParsedDocument {}
 /// A single pre-compiled JSON Pointer segment (see `decoder::compile_one`).
 pub enum PathSeg {
     Key(String),
-    // numeric segment: index if container is array, else object key
-    Num { idx: usize, key: String },
+    /// Numeric segment: an index if the container is an array, else an object key.
+    Num {
+        idx: usize,
+        key: String,
+    },
 }
 
 /// Reusable JSON Pointer paths and their extraction policy. `paths` serves
@@ -31,9 +38,9 @@ pub enum PathSeg {
 pub struct CompiledPaths {
     pub paths: Vec<Vec<PathSeg>>,
     pub plan: sonic_rs::extract::ExtractPlan,
-    pub unique_keys: bool,
+    pub keys: Keys,
     /// Whether fused extraction validates syntax in unselected regions.
-    pub validate: bool,
+    pub validate: Validate,
     /// As in `ParsedDocument`, for fused extraction.
     pub null: rustler::Atom,
     pub missing: rustler::Atom,

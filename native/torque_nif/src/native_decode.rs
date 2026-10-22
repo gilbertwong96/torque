@@ -10,8 +10,7 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
-    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, enif_system_info, ErlNifSysInfo,
+    enif_make_map_put, enif_make_new_map, enif_make_sub_binary, enif_system_info, ErlNifSysInfo,
     ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
@@ -21,7 +20,7 @@ use std::sync::OnceLock;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
-use crate::nif_util::{make_tuple2, map_last_wins, try_make_map, FLATMAP_LIMIT};
+use crate::nif_util::{make_list, make_tuple2, map_last_wins, try_make_map, FLATMAP_LIMIT};
 use crate::types::MAX_DEPTH;
 
 /// Cap on each retained thread-local buffer, so a one-off huge document
@@ -149,12 +148,17 @@ struct KeyOrd {
 
 impl KeyOrd {
     /// Erlang orders binaries by bytes, then length, like `[u8]`'s `Ord`.
+    ///
+    /// # Safety
+    ///
+    /// Neither `ptr` may be null.
     #[inline]
-    fn lt(&self, other: &KeyOrd) -> bool {
+    unsafe fn lt(&self, other: &KeyOrd) -> bool {
         if self.prefix != other.prefix {
             return self.prefix < other.prefix;
         }
-        // SAFETY: both point into the input binary, which outlives the call.
+        // SAFETY: non-null, so both point into the input binary, which
+        // outlives the call.
         unsafe {
             std::slice::from_raw_parts(self.ptr, self.len)
                 < std::slice::from_raw_parts(other.ptr, other.len)
@@ -218,8 +222,8 @@ pub(crate) enum Strings {
     Copy,
 }
 
-pub(crate) struct TermBuilder<'a, 'b> {
-    env: Env<'a>,
+pub(crate) struct TermBuilder<'env, 'bufs> {
+    env: Env<'env>,
     input: InputRef,
     strings: Strings,
     /// Bytes of strings borrowed from the input. Recent ERTS releases copy
@@ -231,27 +235,27 @@ pub(crate) struct TermBuilder<'a, 'b> {
     dropped_members: bool,
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
-    values: &'b mut Vec<ERL_NIF_TERM>,
+    values: &'bufs mut Vec<ERL_NIF_TERM>,
     /// Where each currently-open container's children begin in `values`,
     /// and its members' keys in `key_terms` and `ords`.
-    frames: &'b mut Vec<Frame>,
+    frames: &'bufs mut Vec<Frame>,
     /// Open objects' key terms, kept apart from `values` so an object's keys
     /// and values reach `enif_make_map_from_arrays` without being copied.
-    key_terms: &'b mut Vec<ERL_NIF_TERM>,
-    ords: &'b mut Vec<KeyOrd>,
-    keys: &'b mut KeyCache,
+    key_terms: &'bufs mut Vec<ERL_NIF_TERM>,
+    ords: &'bufs mut Vec<KeyOrd>,
+    keys: &'bufs mut KeyCache,
     /// The term JSON null becomes.
     null: ERL_NIF_TERM,
     empty_map: ERL_NIF_TERM,
     too_deep: bool,
 }
 
-impl<'a, 'b> TermBuilder<'a, 'b> {
+impl<'env, 'bufs> TermBuilder<'env, 'bufs> {
     /// Terms of the values parsed so far, in order. Each parse driven through
     /// the builder leaves exactly one.
     #[inline]
     pub(crate) fn roots(&self) -> &[ERL_NIF_TERM] {
-        debug_assert!(self.frames.is_empty());
+        debug_assert!(self.frames.is_empty(), "a container is still open");
         self.values
     }
 
@@ -277,6 +281,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     #[inline]
     fn empty_map(&mut self) -> ERL_NIF_TERM {
         if self.empty_map == 0 {
+            // SAFETY: `env` is the live env of this call.
             self.empty_map = unsafe { enif_make_new_map(self.env.as_c_arg()) };
         }
         self.empty_map
@@ -290,6 +295,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     fn map_of_one(&mut self, key: ERL_NIF_TERM, value: ERL_NIF_TERM) -> ERL_NIF_TERM {
         let empty = self.empty_map();
         let mut map = 0;
+        // SAFETY: the terms were built in `env`, and `map` is a local the
+        // call writes.
         unsafe { enif_make_map_put(self.env.as_c_arg(), empty, key, value, &mut map) };
         map
     }
@@ -307,6 +314,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         if self.strings == Strings::Borrow {
             if let Some(offset) = self.input.offset_within(s) {
                 self.borrowed += s.len();
+                // SAFETY: `offset_within` checked the span lies inside the
+                // input binary.
                 return unsafe {
                     enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
                 };
@@ -345,6 +354,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         // (`profile_link_color`, `profile_text_color`), so mix in the last 8
         // too or they evict each other from the same slot.
         let tail = if len > 8 {
+            // SAFETY: `s` holds `len` bytes.
             unsafe { (ptr.add(len - 8) as *const u64).read_unaligned() }
         } else {
             0
@@ -357,6 +367,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             && entry.tail == tail
             && entry.len == len as u32
             && (len <= 16
+                // SAFETY: both keys are `len` bytes of the input, which
+                // outlives the call.
                 || unsafe {
                     std::slice::from_raw_parts(entry.ptr.add(8), len - 16)
                         == std::slice::from_raw_parts(ptr.add(8), len - 16)
@@ -369,6 +381,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         // len <= KEY_CACHE_MAX_LEN (64), so either way this is an on-heap
         // binary, not refc.
         let term = if sub_binaries_copy_keys() {
+            // SAFETY: `wide` is the key's offset inside the input binary.
             unsafe { enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, len) }
         } else {
             let mut binary = NewBinary::new(self.env, len);
@@ -404,7 +417,8 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
             || (w[0].prefix == w[1].prefix
                 && !w[0].ptr.is_null()
                 && !w[1].ptr.is_null()
-                && w[0].lt(&w[1]))
+                // SAFETY: both checked non-null just above.
+                && unsafe { w[0].lt(&w[1]) })
     });
     if ordered || ords.iter().any(|o| o.ptr.is_null()) {
         return None;
@@ -413,7 +427,8 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
     let mut moved = false;
     for i in 0..ords.len() {
         let mut j = i;
-        while j > 0 && ords[i].lt(&ords[perm[j - 1] as usize]) {
+        // SAFETY: members with a null `ptr` returned above.
+        while j > 0 && unsafe { ords[i].lt(&ords[perm[j - 1] as usize]) } {
             perm[j] = perm[j - 1];
             j -= 1;
         }
@@ -514,7 +529,7 @@ fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
 }
 
-impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
+impl<'de, 'env, 'bufs> JsonVisitor<'de> for TermBuilder<'env, 'bufs> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
         true
@@ -543,22 +558,19 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_i64(&mut self, val: i64) -> bool {
-        let t = unsafe { enif_make_int64(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
     #[inline]
     fn visit_u64(&mut self, val: u64) -> bool {
-        let t = unsafe { enif_make_uint64(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
     #[inline]
     fn visit_f64(&mut self, val: f64) -> bool {
-        let t = unsafe { enif_make_double(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
@@ -566,8 +578,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     /// raw digits.
     #[inline]
     fn visit_overflow_int(&mut self, raw: &str, as_f64: f64) -> bool {
-        let t = bignum_term(self.env, raw)
-            .unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
+        let t = bignum_term(self.env, raw).unwrap_or_else(|| as_f64.encode(self.env).as_c_arg());
         self.push(t);
         true
     }
@@ -586,6 +597,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         let wide = offset.filter(|&o| self.input.len - o >= 8);
         // First 8 key bytes, little-endian and zero-padded.
         let prefix = if wide.is_some() {
+            // SAFETY: `wide` means 8 input bytes are left from the key's start.
             let w = unsafe { (key.as_ptr() as *const u64).read_unaligned() };
             if len < 8 {
                 w & ((1u64 << (len * 8)) - 1)
@@ -631,10 +643,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             Some(f) => f.values,
             None => return false,
         };
-        let count = (self.values.len() - start) as u32;
-        let list = unsafe {
-            enif_make_list_from_array(self.env.as_c_arg(), self.values[start..].as_ptr(), count)
-        };
+        let list = make_list(self.env, &self.values[start..]).as_c_arg();
         self.values.truncate(start);
         self.values.push(list);
         true
@@ -686,13 +695,13 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 /// Runs `f` with a term builder over the binary `input_term`, whose bytes are
 /// `bytes`, on this scheduler thread's reused stacks and key cache. JSON null
 /// becomes `null`.
-pub(crate) fn with_term_builder<'a, R>(
-    env: Env<'a>,
+pub(crate) fn with_term_builder<'env, R>(
+    env: Env<'env>,
     input_term: ERL_NIF_TERM,
     bytes: &[u8],
     strings: Strings,
     null: ERL_NIF_TERM,
-    f: impl for<'b> FnOnce(&mut TermBuilder<'a, 'b>) -> R,
+    f: impl for<'bufs> FnOnce(&mut TermBuilder<'env, 'bufs>) -> R,
 ) -> R {
     let input = InputRef {
         term: input_term,

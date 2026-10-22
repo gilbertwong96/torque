@@ -1,10 +1,14 @@
+//! Term construction helpers. Like rustler's `Term::new`, they take raw
+//! `ERL_NIF_TERM`s on trust: every raw term passed in must belong to the `env`
+//! passed with it.
+
 use std::mem::MaybeUninit;
 
 use rustler::sys::{
-    enif_get_map_size, enif_make_map_from_arrays, enif_make_map_put, enif_make_new_map,
-    enif_make_tuple_from_array, enif_map_iterator_create, enif_map_iterator_destroy,
-    enif_map_iterator_get_pair, enif_map_iterator_next, ErlNifMapIterator, ErlNifMapIteratorEntry,
-    ERL_NIF_TERM,
+    enif_get_map_size, enif_make_list_from_array, enif_make_map_from_arrays, enif_make_map_put,
+    enif_make_new_map, enif_make_tuple_from_array, enif_map_iterator_create,
+    enif_map_iterator_destroy, enif_map_iterator_get_pair, enif_map_iterator_next,
+    ErlNifMapIterator, ErlNifMapIteratorEntry, ERL_NIF_TERM,
 };
 use rustler::{Env, Term};
 
@@ -12,10 +16,23 @@ use rustler::{Env, Term};
 #[inline]
 pub fn make_tuple2<'a>(env: Env<'a>, a: ERL_NIF_TERM, b: ERL_NIF_TERM) -> Term<'a> {
     let arr: [ERL_NIF_TERM; 2] = [a, b];
+    // SAFETY: `arr` is live for the call, and the tuple is built in `env`.
     unsafe {
         Term::new(
             env,
             enif_make_tuple_from_array(env.as_c_arg(), arr.as_ptr(), 2),
+        )
+    }
+}
+
+/// Build a list from raw NIF terms.
+#[inline]
+pub fn make_list<'a>(env: Env<'a>, terms: &[ERL_NIF_TERM]) -> Term<'a> {
+    // SAFETY: `terms` is live for the call, and the list is built in `env`.
+    unsafe {
+        Term::new(
+            env,
+            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), terms.len() as u32),
         )
     }
 }
@@ -35,35 +52,6 @@ pub fn timeslice_percent(bytes: usize) -> i32 {
 /// are hash maps.
 pub const FLATMAP_LIMIT: usize = 32;
 
-/// Build a map from key and value arrays.
-///
-/// Returns false when ERTS rejects the members, or when duplicate keys
-/// collapsed the map size: before erlang/otp#10976, `enif_make_map_from_arrays`
-/// reported success for a hashmap-sized input with duplicate keys and returned
-/// an invalid map.
-///
-/// # Safety
-///
-/// `keys` and `vals` must point to `count` initialized terms, and `map` to a
-/// writable term.
-#[inline]
-pub unsafe fn map_from_arrays(
-    env: Env,
-    keys: *const ERL_NIF_TERM,
-    vals: *const ERL_NIF_TERM,
-    count: usize,
-    map: *mut ERL_NIF_TERM,
-) -> bool {
-    if enif_make_map_from_arrays(env.as_c_arg(), keys, vals, count, map) == 0 {
-        return false;
-    }
-    if count <= FLATMAP_LIMIT {
-        return true;
-    }
-    let mut size = 0;
-    enif_get_map_size(env.as_c_arg(), *map, &mut size) != 0 && size == count
-}
-
 /// Build a map from an object's keys and values. Duplicate keys fall back to
 /// inserting the members in order, so the last value for a key wins.
 ///
@@ -78,16 +66,40 @@ pub fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_N
 }
 
 /// `make_map` without the fallback: `None` when a key repeats.
+///
+/// Checks the size of a map past the flatmap limit: before erlang/otp#10976,
+/// `enif_make_map_from_arrays` reported success for a hashmap-sized input with
+/// duplicate keys and returned an invalid map.
 #[inline]
 pub fn try_make_map(
     env: Env,
     keys: &[ERL_NIF_TERM],
     vals: &[ERL_NIF_TERM],
 ) -> Option<ERL_NIF_TERM> {
+    let count = keys.len();
+    assert_eq!(count, vals.len(), "every key needs a value");
     let mut map: ERL_NIF_TERM = 0;
-    // SAFETY: `keys` and `vals` are live slices of `keys.len()` terms.
-    unsafe { map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) }
-        .then_some(map)
+    // SAFETY: `keys` and `vals` are live slices of `count` terms, and `map` is
+    // a local the call writes.
+    let built = unsafe {
+        enif_make_map_from_arrays(
+            env.as_c_arg(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            count,
+            &mut map,
+        )
+    };
+    if built == 0 {
+        return None;
+    }
+    if count <= FLATMAP_LIMIT {
+        return Some(map);
+    }
+    let mut size = 0;
+    // SAFETY: `map` is the map just built in this env.
+    let sized = unsafe { enif_get_map_size(env.as_c_arg(), map, &mut size) } != 0;
+    (sized && size == count).then_some(map)
 }
 
 /// Map of an object whose keys repeat: members inserted in source order, so
@@ -95,6 +107,8 @@ pub fn try_make_map(
 #[cold]
 #[inline(never)]
 pub fn map_last_wins(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+    // SAFETY: every map is built in `env`, and `new_map` is a local each put
+    // writes.
     unsafe {
         let mut map = enif_make_new_map(env.as_c_arg());
         for (&key, &val) in keys.iter().zip(vals) {

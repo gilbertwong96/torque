@@ -1,11 +1,11 @@
-use rustler::sys::{enif_make_list_from_array, ERL_NIF_TERM};
-use rustler::{Env, NewBinary, Term};
+use rustler::sys::ERL_NIF_TERM;
+use rustler::{Encoder, Env, NewBinary, Term};
 use sonic_rs::{JsonContainerTrait, JsonType, JsonValueTrait};
 use std::mem::MaybeUninit;
 
 use crate::atoms;
 use crate::native_decode::bignum_term;
-use crate::nif_util::make_map;
+use crate::nif_util::{make_list, make_map};
 
 const STACK_SIZE: usize = 64;
 
@@ -44,34 +44,37 @@ pub fn value_to_term<'a>(
     nodes: &mut usize,
 ) -> Option<Term<'a>> {
     match value.get_type() {
+        // SAFETY: `null` is an atom, valid in every env.
         JsonType::Null => Some(unsafe { Term::new(env, null) }),
-        JsonType::Boolean => Some(if value.as_bool().unwrap() {
+        JsonType::Boolean => Some(if value.as_bool().expect("get_type() said Boolean") {
             atoms::r#true().to_term(env)
         } else {
             atoms::r#false().to_term(env)
         }),
         JsonType::Number => {
             if let Some(n) = value.as_i64() {
-                Some(unsafe { Term::new(env, rustler::sys::enif_make_int64(env.as_c_arg(), n)) })
+                Some(n.encode(env))
             } else if let Some(n) = value.as_u64() {
-                Some(unsafe { Term::new(env, rustler::sys::enif_make_uint64(env.as_c_arg(), n)) })
+                Some(n.encode(env))
             } else if let Some(t) = value
                 .as_raw_number()
                 .and_then(|raw| bignum_term(env, raw.as_str()))
             {
+                // SAFETY: `bignum_term` built `t` in `env`.
                 Some(unsafe { Term::new(env, t) })
             } else {
-                value.as_f64().map(|n| unsafe {
-                    Term::new(env, rustler::sys::enif_make_double(env.as_c_arg(), n))
-                })
+                value.as_f64().map(|n| n.encode(env))
             }
         }
-        JsonType::String => Some(make_binary_term(env, value.as_str().unwrap())),
+        JsonType::String => Some(make_binary_term(
+            env,
+            value.as_str().expect("get_type() said String"),
+        )),
         JsonType::Array => {
             if depth == 0 {
                 return None;
             }
-            let arr: &sonic_rs::Array = value.as_array().unwrap();
+            let arr: &sonic_rs::Array = value.as_array().expect("get_type() said Array");
             let count = arr.len();
             let child_depth = depth - 1;
             *nodes += count;
@@ -81,34 +84,24 @@ pub fn value_to_term<'a>(
                 for (i, v) in arr.iter().enumerate() {
                     terms[i].write(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
-                unsafe {
-                    Some(Term::new(
-                        env,
-                        enif_make_list_from_array(
-                            env.as_c_arg(),
-                            terms.as_ptr() as *const ERL_NIF_TERM,
-                            count as u32,
-                        ),
-                    ))
-                }
+                // SAFETY: the loop initialised the first `count` slots.
+                let terms = unsafe {
+                    std::slice::from_raw_parts(terms.as_ptr() as *const ERL_NIF_TERM, count)
+                };
+                Some(make_list(env, terms))
             } else {
                 let mut terms: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
                 for v in arr.iter() {
                     terms.push(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
-                unsafe {
-                    Some(Term::new(
-                        env,
-                        enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), count as u32),
-                    ))
-                }
+                Some(make_list(env, &terms))
             }
         }
         JsonType::Object => {
             if depth == 0 {
                 return None;
             }
-            let obj: &sonic_rs::Object = value.as_object().unwrap();
+            let obj: &sonic_rs::Object = value.as_object().expect("get_type() said Object");
             let count = obj.len();
             let child_depth = depth - 1;
             *nodes += 2 * count;
@@ -128,6 +121,7 @@ pub fn value_to_term<'a>(
                         std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, count),
                     )
                 };
+                // SAFETY: `make_map` builds the map in `env`.
                 Some(unsafe { Term::new(env, make_map(env, keys, vals)) })
             } else {
                 let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
@@ -136,6 +130,7 @@ pub fn value_to_term<'a>(
                     keys.push(make_binary_term(env, k).as_c_arg());
                     vals.push(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
+                // SAFETY: `make_map` builds the map in `env`.
                 Some(unsafe { Term::new(env, make_map(env, &keys, &vals)) })
             }
         }

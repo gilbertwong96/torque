@@ -1,15 +1,13 @@
 use crate::atoms;
 use crate::native_decode::{self, builder_error_term, with_term_builder, Strings, TermBuilder};
-use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
+use crate::nif_util::{make_list, make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
-use crate::ParsedDocument;
-use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_cell, enif_make_list_from_array,
-    enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
-};
+use crate::{CompiledPaths, ParsedDocument, PathSeg};
+use rustler::sys::{enif_make_list_cell, enif_make_sub_binary, ERL_NIF_TERM};
 use rustler::{
     schedule, Atom, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
+use sonic_rs::extract::{Extracted, Keys, Seg, Validate};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use std::borrow::Cow;
 
@@ -88,12 +86,7 @@ impl TermAcc {
             Some(v) => v.as_slice(),
             None => &self.stack[..self.count],
         };
-        unsafe {
-            Term::new(
-                env,
-                enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), self.count as u32),
-            )
-        }
+        make_list(env, terms)
     }
 }
 
@@ -112,19 +105,28 @@ fn array_index(token: &str) -> Option<usize> {
 
 /// Looks up `key` in an object.
 ///
-/// When `unique_keys` is true, uses sonic-rs's internal index (fast).
-/// Otherwise, does a reverse linear scan so that the last value wins,
-/// matching the duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
+/// With unique keys, uses sonic-rs's internal index (fast). Otherwise, does a
+/// reverse linear scan so that the last value wins, matching the duplicate-key
+/// behaviour of `value_to_term` / `build_map_dedup`.
 #[inline]
 fn object_get<'v>(
     value: &'v sonic_rs::Value,
     key: &str,
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
+    match keys {
+        Keys::Unique => value.get(key),
+        Keys::Repeatable => value.as_object()?.get_last(&key),
+    }
+}
+
+/// The `unique_keys` option as the key policy.
+#[inline]
+fn key_policy(unique_keys: bool) -> Keys {
     if unique_keys {
-        value.get(key)
+        Keys::Unique
     } else {
-        value.as_object()?.get_last(&key)
+        Keys::Repeatable
     }
 }
 
@@ -154,7 +156,7 @@ fn unescape(segment: &str) -> Option<Cow<'_, str>> {
 fn pointer_lookup<'v>(
     value: &'v sonic_rs::Value,
     path: &str,
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
     let bytes = path.as_bytes();
     if bytes.is_empty() {
@@ -175,21 +177,21 @@ fn pointer_lookup<'v>(
                 continue;
             }
         }
-        current = object_get(current, &unescape(segment)?, unique_keys)?;
+        current = object_get(current, &unescape(segment)?, keys)?;
     }
     Some(current)
 }
 
 fn do_parse(
     bytes: &[u8],
-    unique_keys: bool,
+    keys: Keys,
     null: Atom,
     missing: Atom,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
-    let value = sonic_rs::from_slice::<sonic_rs::Value>(bytes)?;
+    let value: sonic_rs::Value = sonic_rs::from_slice(bytes)?;
     Ok(ResourceArc::new(ParsedDocument {
         value,
-        unique_keys,
+        keys,
         null,
         missing,
     }))
@@ -216,7 +218,12 @@ pub(crate) fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<
 
 #[rustler::nif]
 fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
+    match do_parse(
+        json.as_slice(),
+        Keys::Repeatable,
+        atoms::nil(),
+        atoms::nil(),
+    ) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -227,7 +234,12 @@ fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
+    match do_parse(
+        json.as_slice(),
+        Keys::Repeatable,
+        atoms::nil(),
+        atoms::nil(),
+    ) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
@@ -241,7 +253,7 @@ fn parse_opts<'a>(
     null: Atom,
     missing: Atom,
 ) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys, null, missing) {
+    match do_parse(json.as_slice(), key_policy(unique_keys), null, missing) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -258,7 +270,7 @@ fn parse_opts_dirty<'a>(
     null: Atom,
     missing: Atom,
 ) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys, null, missing) {
+    match do_parse(json.as_slice(), key_policy(unique_keys), null, missing) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
@@ -268,17 +280,17 @@ fn parse_opts_dirty<'a>(
 fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
     let ok_raw = atoms::ok().as_c_arg();
     let err_raw = atoms::error().as_c_arg();
-    let nsf_raw = atoms::no_such_field().as_c_arg();
-    let ntd_raw = atoms::nesting_too_deep().as_c_arg();
+    let no_such_field = atoms::no_such_field().as_c_arg();
+    let nesting_too_deep = atoms::nesting_too_deep().as_c_arg();
     let mut nodes = 0usize;
-    let result = match pointer_lookup(&doc.value, path, doc.unique_keys) {
+    let result = match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => {
             match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, &mut nodes) {
                 Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
-                None => make_tuple2(env, err_raw, ntd_raw),
+                None => make_tuple2(env, err_raw, nesting_too_deep),
             }
         }
-        None => make_tuple2(env, err_raw, nsf_raw),
+        None => make_tuple2(env, err_raw, no_such_field),
     };
     consume_timeslice_nodes(env, nodes);
     result
@@ -288,8 +300,8 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
 struct ResultAtoms {
     ok: ERL_NIF_TERM,
     err: ERL_NIF_TERM,
-    nsf: ERL_NIF_TERM,
-    ntd: ERL_NIF_TERM,
+    no_such_field: ERL_NIF_TERM,
+    nesting_too_deep: ERL_NIF_TERM,
 }
 
 #[inline]
@@ -300,12 +312,12 @@ fn get_one_result(
     atoms: &ResultAtoms,
     nodes: &mut usize,
 ) -> ERL_NIF_TERM {
-    match pointer_lookup(&doc.value, path, doc.unique_keys) {
+    match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, nodes) {
             Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
-            None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
+            None => make_tuple2(env, atoms.err, atoms.nesting_too_deep).as_c_arg(),
         },
-        None => make_tuple2(env, atoms.err, atoms.nsf).as_c_arg(),
+        None => make_tuple2(env, atoms.err, atoms.no_such_field).as_c_arg(),
     }
 }
 
@@ -318,8 +330,8 @@ fn get_many<'a>(
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
         err: atoms::error().as_c_arg(),
-        nsf: atoms::no_such_field().as_c_arg(),
-        ntd: atoms::nesting_too_deep().as_c_arg(),
+        no_such_field: atoms::no_such_field().as_c_arg(),
+        nesting_too_deep: atoms::nesting_too_deep().as_c_arg(),
     };
     let mut nodes = 0usize;
     let mut acc = TermAcc::new();
@@ -336,16 +348,8 @@ fn get_many<'a>(
 
 #[rustler::nif]
 fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
-    match pointer_lookup(&doc.value, path, doc.unique_keys) {
-        Some(value) if value.is_array() => {
-            let len = value.as_array().unwrap().len();
-            unsafe {
-                Term::new(
-                    env,
-                    rustler::sys::enif_make_uint64(env.as_c_arg(), len as u64),
-                )
-            }
-        }
+    match pointer_lookup(&doc.value, path, doc.keys).and_then(|v| v.as_array()) {
+        Some(array) => (array.len() as u64).encode(env),
         _ => doc.missing.to_term(env),
     }
 }
@@ -415,7 +419,6 @@ fn decode_strings(copy_strings: bool) -> Strings {
 // `~`-unescape, index-vs-key classification) lets the per-request call skip all
 // per-path string work — roughly halving extraction time — and fusing the parse
 // and the extraction into one NIF call avoids materializing a document handle.
-use crate::{CompiledPaths, PathSeg};
 
 /// Pre-split a single JSON Pointer into segments. A numeric segment is stored as
 /// `Num`, keeping both the parsed index and the literal key so the lookup can
@@ -469,8 +472,12 @@ fn compile_paths<'a>(
     Ok(ResourceArc::new(CompiledPaths {
         paths: out,
         plan,
-        unique_keys,
-        validate,
+        keys: key_policy(unique_keys),
+        validate: if validate {
+            Validate::Yes
+        } else {
+            Validate::No
+        },
         null,
         missing,
     })
@@ -481,7 +488,6 @@ fn compile_paths<'a>(
 fn plan_segs(
     segs: &[PathSeg],
 ) -> impl ExactSizeIterator<Item = sonic_rs::extract::Seg<'_>> + use<'_> {
-    use sonic_rs::extract::Seg;
     segs.iter().map(|s| match s {
         PathSeg::Key(k) => Seg::Key(k),
         PathSeg::Num { idx, key } => Seg::Index { idx: *idx, key },
@@ -502,7 +508,7 @@ fn extract_compiled<'a>(
     let missing = doc.missing.as_c_arg();
     let mut acc = TermAcc::with_hint(compiled.paths.len());
     for segs in compiled.paths.iter() {
-        let r = match pointer_lookup_compiled(&doc.value, segs, compiled.unique_keys) {
+        let r = match pointer_lookup_compiled(&doc.value, segs, compiled.keys) {
             Some(v) => value_to_term(env, v, null, MAX_DEPTH, nodes)
                 .map(|t| t.as_c_arg())
                 .unwrap_or(missing),
@@ -528,6 +534,8 @@ fn extracted_str_term(
         if let Some(offset) = (s.as_ptr() as usize).checked_sub(input.as_ptr() as usize) {
             if let Some(room) = input.len().checked_sub(offset) {
                 if s.len() <= room {
+                    // SAFETY: `input_term` is the binary `input` reads, and
+                    // the slice was just checked to lie inside it.
                     return unsafe {
                         enif_make_sub_binary(env.as_c_arg(), input_term, offset, s.len())
                     };
@@ -595,8 +603,6 @@ fn rebuild_copied(
     values: &[Option<sonic_rs::extract::Extracted>],
     builder: &mut TermBuilder,
 ) -> Vec<ERL_NIF_TERM> {
-    use sonic_rs::extract::Extracted;
-
     let mut terms = builder.roots().to_vec();
     builder.set_strings(Strings::Copy);
     for (slot, v) in values.iter().enumerate() {
@@ -628,19 +634,6 @@ fn do_parse_get_many_nil<'a>(
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> Term<'a> {
-    use sonic_rs::extract::{Extracted, Keys, Validate};
-
-    let validate = if compiled.validate {
-        Validate::Yes
-    } else {
-        Validate::No
-    };
-    let keys = if compiled.unique_keys {
-        Keys::Unique
-    } else {
-        Keys::Repeatable
-    };
-
     with_term_builder(
         env,
         input_term,
@@ -651,8 +644,8 @@ fn do_parse_get_many_nil<'a>(
             let values = match sonic_rs::extract::extract_with(
                 bytes,
                 &compiled.plan,
-                validate,
-                keys,
+                compiled.validate,
+                compiled.keys,
                 builder,
             ) {
                 Ok(values) => values,
@@ -680,8 +673,7 @@ fn do_parse_get_many_nil<'a>(
             let rebuilt = (!borrow && builder.borrowed() > 0)
                 .then(|| rebuild_copied(bytes, &compiled.plan, &values, builder));
             // Consed from the back, so the list needs no staging buffer.
-            let mut list =
-                unsafe { enif_make_list_from_array(env.as_c_arg(), std::ptr::null(), 0) };
+            let mut list = make_list(env, &[]).as_c_arg();
             for (slot, v) in values.iter().enumerate().rev() {
                 let t = match v {
                     // A string the parser never had to unescape is still in the
@@ -700,9 +692,9 @@ fn do_parse_get_many_nil<'a>(
                             None => builder.roots()[*root],
                         }
                     }
-                    Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
-                    Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
-                    Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                    Some(Extracted::U64(n)) => n.encode(env).as_c_arg(),
+                    Some(Extracted::I64(n)) => n.encode(env).as_c_arg(),
+                    Some(Extracted::F64(n)) => n.encode(env).as_c_arg(),
                     Some(Extracted::BigInt(raw)) => {
                         native_decode::bignum_term(env, raw).unwrap_or(missing)
                     }
@@ -714,6 +706,7 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::Null) => null,
                     None => missing,
                 };
+                // SAFETY: `t` and `list` were built in `env`.
                 list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
             }
             make_tuple2(env, atoms::ok().as_c_arg(), list)
@@ -751,17 +744,17 @@ fn parse_get_many_nil_dirty<'a>(
 fn pointer_lookup_compiled<'v>(
     value: &'v sonic_rs::Value,
     segs: &[PathSeg],
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
     let mut current = value;
     for seg in segs {
         current = match seg {
-            PathSeg::Key(k) => object_get(current, k, unique_keys)?,
+            PathSeg::Key(k) => object_get(current, k, keys)?,
             PathSeg::Num { idx, key } => {
                 if current.is_array() {
                     current.get(*idx)?
                 } else {
-                    object_get(current, key, unique_keys)?
+                    object_get(current, key, keys)?
                 }
             }
         };
@@ -795,7 +788,7 @@ fn get_many_nil<'a>(
     for path_term in paths {
         // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
         let path: &str = path_term.decode()?;
-        let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
+        let r = match pointer_lookup(&doc.value, path, doc.keys) {
             Some(value) => match value_to_term(env, value, null, MAX_DEPTH, &mut nodes) {
                 Some(term) => term.as_c_arg(),
                 None => missing,

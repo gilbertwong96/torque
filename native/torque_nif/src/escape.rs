@@ -1,15 +1,27 @@
-// SIMD-accelerated JSON string escaping with optional UTF-8 validation.
-//
-// Entry points:
-//   `escape_to_vec(bytes, buf)` — escape only (for known-valid UTF-8, e.g. atom names)
-//   `write_json_string(bytes, buf)` — validate, escape, and add quotes
-//
-// Platform dispatch:
-//   aarch64 → NEON (vmaxvq_u8 / UMAXV, mandatory on AArch64)
-//   x86_64  → AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
-//   other   → scalar fallback
+//! SIMD-accelerated JSON string escaping with optional UTF-8 validation.
+//!
+//! Entry points:
+//! - `escape_to_vec(bytes, buf)`: escape only, for known-valid UTF-8 such as
+//!   atom names
+//! - `write_json_string(bytes, buf)`: validate, escape, and add quotes
+//!
+//! Platform dispatch:
+//! - aarch64: NEON (`vmaxvq_u8` / UMAXV, mandatory on AArch64)
+//! - x86_64: AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
+//! - other: scalar fallback
 
-type QuoteEntry = (u8, [u8; 8]); // (output_len, escape_bytes)
+/// An input byte's JSON spelling: the first `len` bytes of `bytes`.
+#[derive(Clone, Copy)]
+struct QuoteEntry {
+    len: u8,
+    bytes: [u8; 8],
+}
+
+impl QuoteEntry {
+    const fn new(len: u8, bytes: [u8; 8]) -> Self {
+        QuoteEntry { len, bytes }
+    }
+}
 
 const fn hex_nibble(n: u8) -> u8 {
     if n < 10 {
@@ -20,31 +32,31 @@ const fn hex_nibble(n: u8) -> u8 {
 }
 
 const fn build_quote_tab() -> [QuoteEntry; 256] {
-    let mut tab = [(0u8, [0u8; 8]); 256];
+    let mut tab = [QuoteEntry::new(0, [0; 8]); 256];
     // Initialize all bytes as passthrough (len=1, first byte = b itself).
     let mut i = 0usize;
     while i < 256 {
         let b = i as u8;
-        tab[i] = (1, [b, 0, 0, 0, 0, 0, 0, 0]);
+        tab[i] = QuoteEntry::new(1, [b, 0, 0, 0, 0, 0, 0, 0]);
         i += 1;
     }
     // Named 2-byte escapes. Must be set BEFORE the \u00XX loop below so
-    // the loop skips them (it checks tab[b].0 == 1 as the passthrough sentinel).
-    tab[b'"' as usize] = (2, [b'\\', b'"', 0, 0, 0, 0, 0, 0]);
-    tab[b'\\' as usize] = (2, [b'\\', b'\\', 0, 0, 0, 0, 0, 0]);
-    tab[b'\n' as usize] = (2, [b'\\', b'n', 0, 0, 0, 0, 0, 0]);
-    tab[b'\r' as usize] = (2, [b'\\', b'r', 0, 0, 0, 0, 0, 0]);
-    tab[b'\t' as usize] = (2, [b'\\', b't', 0, 0, 0, 0, 0, 0]);
-    tab[0x08] = (2, [b'\\', b'b', 0, 0, 0, 0, 0, 0]);
-    tab[0x0C] = (2, [b'\\', b'f', 0, 0, 0, 0, 0, 0]);
+    // the loop skips them (it checks tab[b].len == 1 as the passthrough sentinel).
+    tab[b'"' as usize] = QuoteEntry::new(2, [b'\\', b'"', 0, 0, 0, 0, 0, 0]);
+    tab[b'\\' as usize] = QuoteEntry::new(2, [b'\\', b'\\', 0, 0, 0, 0, 0, 0]);
+    tab[b'\n' as usize] = QuoteEntry::new(2, [b'\\', b'n', 0, 0, 0, 0, 0, 0]);
+    tab[b'\r' as usize] = QuoteEntry::new(2, [b'\\', b'r', 0, 0, 0, 0, 0, 0]);
+    tab[b'\t' as usize] = QuoteEntry::new(2, [b'\\', b't', 0, 0, 0, 0, 0, 0]);
+    tab[0x08] = QuoteEntry::new(2, [b'\\', b'b', 0, 0, 0, 0, 0, 0]);
+    tab[0x0C] = QuoteEntry::new(2, [b'\\', b'f', 0, 0, 0, 0, 0, 0]);
     // Remaining control bytes (0x00–0x1F without a named escape): \u00XX
     let mut b = 0u8;
     while b < 0x20 {
-        if tab[b as usize].0 == 1 {
+        if tab[b as usize].len == 1 {
             // Still passthrough → replace with 6-byte \u00XX form.
             let hi = hex_nibble(b >> 4);
             let lo = hex_nibble(b & 0x0F);
-            tab[b as usize] = (6, [b'\\', b'u', b'0', b'0', hi, lo, 0, 0]);
+            tab[b as usize] = QuoteEntry::new(6, [b'\\', b'u', b'0', b'0', hi, lo, 0, 0]);
         }
         b += 1;
     }
@@ -70,6 +82,10 @@ const fn build_needs_escape() -> [bool; 256] {
 }
 
 static NEEDS_ESCAPE: [bool; 256] = build_needs_escape();
+
+/// A string handed to the validating kernels is not UTF-8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvalidUtf8;
 
 // ---------------------------------------------------------------------------
 // Short-string fast path
@@ -131,35 +147,40 @@ unsafe fn escape_prefix(src: *const u8, len: usize, dst: *mut u8) -> usize {
 // UTF-8 validation helpers
 // ---------------------------------------------------------------------------
 
+/// Width of the UTF-8 sequence starting at `pos`.
+///
+/// # Safety
+///
+/// `src` must be readable for `len` bytes, and `pos < len`.
 #[inline]
-unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<usize, ()> {
+unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<usize, InvalidUtf8> {
     let b0 = *src.add(pos);
     let width = match b0 {
         0xC2..=0xDF => 2,
         0xE0..=0xEF => 3,
         0xF0..=0xF4 => 4,
-        _ => return Err(()), // 0x80-0xC1 or 0xF5-0xFF
+        _ => return Err(InvalidUtf8), // 0x80-0xC1 or 0xF5-0xFF
     };
     if pos + width > len {
-        return Err(());
+        return Err(InvalidUtf8);
     }
     match width {
         2 => {
             if *src.add(pos + 1) & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         3 => {
             let b1 = *src.add(pos + 1);
             let b2 = *src.add(pos + 2);
             if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xE0 && b1 < 0xA0 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xED && b1 >= 0xA0 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         4 => {
@@ -167,13 +188,13 @@ unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<us
             let b2 = *src.add(pos + 2);
             let b3 = *src.add(pos + 3);
             if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 || b3 & 0xC0 != 0x80 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xF0 && b1 < 0x90 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
             if b0 == 0xF4 && b1 >= 0x90 {
-                return Err(());
+                return Err(InvalidUtf8);
             }
         }
         _ => unreachable!(),
@@ -197,6 +218,7 @@ pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
     }
     buf.reserve(len * 6 + 32);
     let base = buf.len();
+    // SAFETY: the reserve covers the kernels' `6 * len` bound past `base`.
     let written = unsafe {
         let dst = buf.as_mut_ptr().add(base);
         let done = if len < SHORT_STRING {
@@ -210,6 +232,7 @@ pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
             done + escape_dispatch(bytes.as_ptr().add(done), len - done, dst.add(done))
         }
     };
+    // SAFETY: the kernels initialised `written` bytes past `base`.
     unsafe { buf.set_len(base + written) };
 }
 
@@ -249,7 +272,10 @@ unsafe fn escape_neon(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -298,7 +324,10 @@ unsafe fn escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -352,7 +381,10 @@ unsafe fn escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -362,6 +394,10 @@ unsafe fn escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> usize {
     out_pos + escape_scalar(src.add(in_pos), len - in_pos, dst.add(out_pos))
 }
 
+/// # Safety
+///
+/// `src` must be readable for `len` bytes and `dst` writable for `6 * len`
+/// bytes.
 unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
@@ -375,7 +411,10 @@ unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
                 std::ptr::copy_nonoverlapping(src.add(start), dst.add(out_pos), copy_len);
                 out_pos += copy_len;
             }
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
             out_pos += esc_len as usize;
             start = in_pos + 1;
@@ -392,6 +431,9 @@ unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
     out_pos
 }
 
+/// # Safety
+///
+/// As for `escape_scalar`.
 unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
@@ -418,13 +460,15 @@ unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
 
 /// Appends `bytes` as a quoted, escaped JSON string.
 ///
-/// Returns `Err(())` for invalid UTF-8. Capacity for the maximum expansion is
+/// Returns `Err(InvalidUtf8)` for invalid UTF-8. Capacity for the maximum expansion is
 /// reserved before writing through the vector's spare capacity.
 #[inline]
-pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), ()> {
+pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), InvalidUtf8> {
     let len = bytes.len();
     buf.reserve(len * 6 + 34);
     let base = buf.len();
+    // SAFETY: the reserve covers both quotes and the kernels' `6 * len` bound
+    // past `base`, and `set_len` covers only the bytes written.
     unsafe {
         let dst = buf.as_mut_ptr().add(base);
         *dst = b'"';
@@ -455,7 +499,11 @@ pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), (
 /// bytes; escapes overrun what they keep, but not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_neon(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::aarch64::*;
 
     let thresh = vdupq_n_u8(0x20);
@@ -493,7 +541,10 @@ unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Resu
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -514,7 +565,11 @@ unsafe fn validate_escape_neon(src: *const u8, len: usize, dst: *mut u8) -> Resu
 /// not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_avx2(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::x86_64::*;
 
     let thresh = _mm256_set1_epi8(0x20u8 as i8);
@@ -553,7 +608,10 @@ unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Resu
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -581,7 +639,11 @@ unsafe fn validate_escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> Resu
 /// bytes; escapes overrun what they keep, but not that (see `QUOTE_TAB`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+unsafe fn validate_escape_sse2(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     use std::arch::x86_64::*;
 
     let thresh = _mm_set1_epi8(0x20u8 as i8);
@@ -620,7 +682,10 @@ unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Resu
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -636,6 +701,11 @@ unsafe fn validate_escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> Resu
 /// multi-byte characters (CJK, emoji) one byte at a time. One SIMD validation
 /// pass followed by the escape-only kernel, which copies high bytes through,
 /// keeps both at vector width.
+///
+/// # Safety
+///
+/// `src` must be readable for `len` bytes, `in_pos <= len`, and `dst` writable
+/// for `out_pos + 6 * (len - in_pos)` bytes.
 #[inline(never)]
 unsafe fn finish_non_ascii(
     src: *const u8,
@@ -643,10 +713,10 @@ unsafe fn finish_non_ascii(
     len: usize,
     dst: *mut u8,
     out_pos: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, InvalidUtf8> {
     let rest = std::slice::from_raw_parts(src.add(in_pos), len - in_pos);
     if simdutf8::basic::from_utf8(rest).is_err() {
-        return Err(());
+        return Err(InvalidUtf8);
     }
     Ok(out_pos + escape_dispatch(rest.as_ptr(), rest.len(), dst.add(out_pos)))
 }
@@ -655,7 +725,15 @@ unsafe fn finish_non_ascii(
 // Scalar — validating
 // ---------------------------------------------------------------------------
 
-unsafe fn validate_escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+/// # Safety
+///
+/// `src` must be readable for `len` bytes and `dst` writable for `6 * len`
+/// bytes.
+unsafe fn validate_escape_scalar(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
     let mut start = 0usize;
@@ -680,7 +758,10 @@ unsafe fn validate_escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> Re
                 std::ptr::copy_nonoverlapping(src.add(start), dst.add(out_pos), copy_len);
                 out_pos += copy_len;
             }
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
             out_pos += esc_len as usize;
             in_pos += 1;
@@ -703,7 +784,14 @@ unsafe fn validate_escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> Re
 // Dispatch — validating
 // ---------------------------------------------------------------------------
 
-unsafe fn validate_escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> Result<usize, ()> {
+/// # Safety
+///
+/// As for `validate_escape_scalar`.
+unsafe fn validate_escape_dispatch(
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+) -> Result<usize, InvalidUtf8> {
     #[cfg(target_arch = "aarch64")]
     {
         validate_escape_neon(src, len, dst)
@@ -737,6 +825,7 @@ mod tests {
 
     fn prefix_of(bytes: &[u8]) -> (usize, Vec<u8>) {
         let mut dst = vec![0xAAu8; bytes.len() + 8];
+        // SAFETY: `dst` has room for `bytes.len()` bytes.
         let n = unsafe { escape_prefix(bytes.as_ptr(), bytes.len(), dst.as_mut_ptr()) };
         (n, dst)
     }
@@ -792,7 +881,7 @@ mod tests {
                     }
                     let mut want = vec![b'"'];
                     for &b in &input {
-                        let (n, esc) = QUOTE_TAB[b as usize];
+                        let QuoteEntry { len: n, bytes: esc } = QUOTE_TAB[b as usize];
                         want.extend_from_slice(&esc[..n as usize]);
                     }
                     want.push(b'"');
@@ -831,17 +920,19 @@ mod tests {
         use super::super::*;
 
         type Escape = unsafe fn(*const u8, usize, *mut u8) -> usize;
-        type Validate = unsafe fn(*const u8, usize, *mut u8) -> Result<usize, ()>;
+        type Validate = unsafe fn(*const u8, usize, *mut u8) -> Result<usize, InvalidUtf8>;
 
         fn escape_with(kernel: Escape, input: &[u8]) -> Vec<u8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
+            // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
             let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr()) };
             dst.truncate(n);
             dst
         }
 
-        fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, ()> {
+        fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, InvalidUtf8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
+            // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
             let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr())? };
             dst.truncate(n);
             Ok(dst)
@@ -965,21 +1056,22 @@ mod tests {
 
     #[test]
     fn the_kernels_write_nothing_past_six_times_the_input() {
-        type Kernel = fn(*const u8, usize, *mut u8) -> usize;
+        type Kernel = unsafe fn(*const u8, usize, *mut u8) -> usize;
+        unsafe fn validate(s: *const u8, l: usize, d: *mut u8) -> usize {
+            validate_escape_dispatch(s, l, d).expect("ascii")
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe fn validate_sse2(s: *const u8, l: usize, d: *mut u8) -> usize {
+            validate_escape_sse2(s, l, d).expect("ascii")
+        }
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut kernels: Vec<(&str, Kernel)> = vec![
-            ("escape", |s, l, d| unsafe { escape_dispatch(s, l, d) }),
-            ("validate", |s, l, d| unsafe {
-                validate_escape_dispatch(s, l, d).expect("ascii")
-            }),
-        ];
+        let mut kernels: Vec<(&str, Kernel)> =
+            vec![("escape", escape_dispatch), ("validate", validate)];
         // Dispatch prefers AVX2, which reaches SSE2 only for its tail.
         #[cfg(target_arch = "x86_64")]
         {
-            kernels.push(("escape_sse2", |s, l, d| unsafe { escape_sse2(s, l, d) }));
-            kernels.push(("validate_sse2", |s, l, d| unsafe {
-                validate_escape_sse2(s, l, d).expect("ascii")
-            }));
+            kernels.push(("escape_sse2", escape_sse2));
+            kernels.push(("validate_sse2", validate_sse2));
         }
 
         for len in 0..200usize {
@@ -988,14 +1080,15 @@ mod tests {
                 let want: Vec<u8> = input
                     .iter()
                     .flat_map(|&b| {
-                        let (n, esc) = QUOTE_TAB[b as usize];
+                        let QuoteEntry { len: n, bytes: esc } = QUOTE_TAB[b as usize];
                         esc[..n as usize].to_vec()
                     })
                     .collect();
                 for (name, kernel) in &kernels {
                     let bound = 6 * len;
                     let mut dst = vec![0xAAu8; bound + 64];
-                    let n = kernel(input.as_ptr(), len, dst.as_mut_ptr());
+                    // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
+                    let n = unsafe { kernel(input.as_ptr(), len, dst.as_mut_ptr()) };
                     assert_eq!(&dst[..n], &want[..], "{name}: len {len} period {period}");
                     assert!(
                         dst[bound..].iter().all(|&b| b == 0xAA),
