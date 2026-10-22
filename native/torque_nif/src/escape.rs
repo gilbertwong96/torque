@@ -10,7 +10,18 @@
 //! - x86_64: AVX2 (32-byte lanes, runtime-detected), else SSE2 (baseline)
 //! - other: scalar fallback
 
-type QuoteEntry = (u8, [u8; 8]); // (output_len, escape_bytes)
+/// An input byte's JSON spelling: the first `len` bytes of `bytes`.
+#[derive(Clone, Copy)]
+struct QuoteEntry {
+    len: u8,
+    bytes: [u8; 8],
+}
+
+impl QuoteEntry {
+    const fn new(len: u8, bytes: [u8; 8]) -> Self {
+        QuoteEntry { len, bytes }
+    }
+}
 
 const fn hex_nibble(n: u8) -> u8 {
     if n < 10 {
@@ -21,31 +32,31 @@ const fn hex_nibble(n: u8) -> u8 {
 }
 
 const fn build_quote_tab() -> [QuoteEntry; 256] {
-    let mut tab = [(0u8, [0u8; 8]); 256];
+    let mut tab = [QuoteEntry::new(0, [0; 8]); 256];
     // Initialize all bytes as passthrough (len=1, first byte = b itself).
     let mut i = 0usize;
     while i < 256 {
         let b = i as u8;
-        tab[i] = (1, [b, 0, 0, 0, 0, 0, 0, 0]);
+        tab[i] = QuoteEntry::new(1, [b, 0, 0, 0, 0, 0, 0, 0]);
         i += 1;
     }
     // Named 2-byte escapes. Must be set BEFORE the \u00XX loop below so
-    // the loop skips them (it checks tab[b].0 == 1 as the passthrough sentinel).
-    tab[b'"' as usize] = (2, [b'\\', b'"', 0, 0, 0, 0, 0, 0]);
-    tab[b'\\' as usize] = (2, [b'\\', b'\\', 0, 0, 0, 0, 0, 0]);
-    tab[b'\n' as usize] = (2, [b'\\', b'n', 0, 0, 0, 0, 0, 0]);
-    tab[b'\r' as usize] = (2, [b'\\', b'r', 0, 0, 0, 0, 0, 0]);
-    tab[b'\t' as usize] = (2, [b'\\', b't', 0, 0, 0, 0, 0, 0]);
-    tab[0x08] = (2, [b'\\', b'b', 0, 0, 0, 0, 0, 0]);
-    tab[0x0C] = (2, [b'\\', b'f', 0, 0, 0, 0, 0, 0]);
+    // the loop skips them (it checks tab[b].len == 1 as the passthrough sentinel).
+    tab[b'"' as usize] = QuoteEntry::new(2, [b'\\', b'"', 0, 0, 0, 0, 0, 0]);
+    tab[b'\\' as usize] = QuoteEntry::new(2, [b'\\', b'\\', 0, 0, 0, 0, 0, 0]);
+    tab[b'\n' as usize] = QuoteEntry::new(2, [b'\\', b'n', 0, 0, 0, 0, 0, 0]);
+    tab[b'\r' as usize] = QuoteEntry::new(2, [b'\\', b'r', 0, 0, 0, 0, 0, 0]);
+    tab[b'\t' as usize] = QuoteEntry::new(2, [b'\\', b't', 0, 0, 0, 0, 0, 0]);
+    tab[0x08] = QuoteEntry::new(2, [b'\\', b'b', 0, 0, 0, 0, 0, 0]);
+    tab[0x0C] = QuoteEntry::new(2, [b'\\', b'f', 0, 0, 0, 0, 0, 0]);
     // Remaining control bytes (0x00–0x1F without a named escape): \u00XX
     let mut b = 0u8;
     while b < 0x20 {
-        if tab[b as usize].0 == 1 {
+        if tab[b as usize].len == 1 {
             // Still passthrough → replace with 6-byte \u00XX form.
             let hi = hex_nibble(b >> 4);
             let lo = hex_nibble(b & 0x0F);
-            tab[b as usize] = (6, [b'\\', b'u', b'0', b'0', hi, lo, 0, 0]);
+            tab[b as usize] = QuoteEntry::new(6, [b'\\', b'u', b'0', b'0', hi, lo, 0, 0]);
         }
         b += 1;
     }
@@ -261,7 +272,10 @@ unsafe fn escape_neon(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -310,7 +324,10 @@ unsafe fn escape_avx2(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -364,7 +381,10 @@ unsafe fn escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> usize {
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -391,7 +411,10 @@ unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
                 std::ptr::copy_nonoverlapping(src.add(start), dst.add(out_pos), copy_len);
                 out_pos += copy_len;
             }
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
             out_pos += esc_len as usize;
             start = in_pos + 1;
@@ -518,7 +541,10 @@ unsafe fn validate_escape_neon(
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -582,7 +608,10 @@ unsafe fn validate_escape_avx2(
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -653,7 +682,10 @@ unsafe fn validate_escape_sse2(
             out_pos += first;
 
             let b = *src.add(in_pos + first);
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             (dst.add(out_pos) as *mut [u8; 8]).write_unaligned(esc_bytes);
             out_pos += esc_len as usize;
             in_pos += first + 1;
@@ -726,7 +758,10 @@ unsafe fn validate_escape_scalar(
                 std::ptr::copy_nonoverlapping(src.add(start), dst.add(out_pos), copy_len);
                 out_pos += copy_len;
             }
-            let (esc_len, esc_bytes) = QUOTE_TAB[b as usize];
+            let QuoteEntry {
+                len: esc_len,
+                bytes: esc_bytes,
+            } = QUOTE_TAB[b as usize];
             std::ptr::copy_nonoverlapping(esc_bytes.as_ptr(), dst.add(out_pos), esc_len as usize);
             out_pos += esc_len as usize;
             in_pos += 1;
@@ -846,7 +881,7 @@ mod tests {
                     }
                     let mut want = vec![b'"'];
                     for &b in &input {
-                        let (n, esc) = QUOTE_TAB[b as usize];
+                        let QuoteEntry { len: n, bytes: esc } = QUOTE_TAB[b as usize];
                         want.extend_from_slice(&esc[..n as usize]);
                     }
                     want.push(b'"');
@@ -1045,7 +1080,7 @@ mod tests {
                 let want: Vec<u8> = input
                     .iter()
                     .flat_map(|&b| {
-                        let (n, esc) = QUOTE_TAB[b as usize];
+                        let QuoteEntry { len: n, bytes: esc } = QUOTE_TAB[b as usize];
                         esc[..n as usize].to_vec()
                     })
                     .collect();
