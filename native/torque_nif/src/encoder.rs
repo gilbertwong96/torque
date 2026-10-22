@@ -126,6 +126,7 @@ thread_local! {
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EncodeError {
     UnsupportedType,
     NonFiniteFloat,
