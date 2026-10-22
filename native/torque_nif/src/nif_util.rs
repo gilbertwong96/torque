@@ -107,6 +107,8 @@ pub fn try_make_map(
 #[cold]
 #[inline(never)]
 pub fn map_last_wins(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_NIF_TERM {
+    // SAFETY: every map is built in `env`, and `new_map` is a local each put
+    // writes.
     unsafe {
         let mut map = enif_make_new_map(env.as_c_arg());
         for (&key, &val) in keys.iter().zip(vals) {

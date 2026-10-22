@@ -281,6 +281,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     #[inline]
     fn empty_map(&mut self) -> ERL_NIF_TERM {
         if self.empty_map == 0 {
+            // SAFETY: `env` is the live env of this call.
             self.empty_map = unsafe { enif_make_new_map(self.env.as_c_arg()) };
         }
         self.empty_map
@@ -294,6 +295,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
     fn map_of_one(&mut self, key: ERL_NIF_TERM, value: ERL_NIF_TERM) -> ERL_NIF_TERM {
         let empty = self.empty_map();
         let mut map = 0;
+        // SAFETY: the terms were built in `env`, and `map` is a local the
+        // call writes.
         unsafe { enif_make_map_put(self.env.as_c_arg(), empty, key, value, &mut map) };
         map
     }
@@ -311,6 +314,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         if self.strings == Strings::Borrow {
             if let Some(offset) = self.input.offset_within(s) {
                 self.borrowed += s.len();
+                // SAFETY: `offset_within` checked the span lies inside the
+                // input binary.
                 return unsafe {
                     enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, s.len())
                 };
@@ -349,6 +354,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         // (`profile_link_color`, `profile_text_color`), so mix in the last 8
         // too or they evict each other from the same slot.
         let tail = if len > 8 {
+            // SAFETY: `s` holds `len` bytes.
             unsafe { (ptr.add(len - 8) as *const u64).read_unaligned() }
         } else {
             0
@@ -361,6 +367,8 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
             && entry.tail == tail
             && entry.len == len as u32
             && (len <= 16
+                // SAFETY: both keys are `len` bytes of the input, which
+                // outlives the call.
                 || unsafe {
                     std::slice::from_raw_parts(entry.ptr.add(8), len - 16)
                         == std::slice::from_raw_parts(ptr.add(8), len - 16)
@@ -373,6 +381,7 @@ impl<'a, 'b> TermBuilder<'a, 'b> {
         // len <= KEY_CACHE_MAX_LEN (64), so either way this is an on-heap
         // binary, not refc.
         let term = if sub_binaries_copy_keys() {
+            // SAFETY: `wide` is the key's offset inside the input binary.
             unsafe { enif_make_sub_binary(self.env.as_c_arg(), self.input.term, offset, len) }
         } else {
             let mut binary = NewBinary::new(self.env, len);
@@ -588,6 +597,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
         let wide = offset.filter(|&o| self.input.len - o >= 8);
         // First 8 key bytes, little-endian and zero-padded.
         let prefix = if wide.is_some() {
+            // SAFETY: `wide` means 8 input bytes are left from the key's start.
             let w = unsafe { (key.as_ptr() as *const u64).read_unaligned() };
             if len < 8 {
                 w & ((1u64 << (len * 8)) - 1)

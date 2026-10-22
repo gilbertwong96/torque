@@ -181,6 +181,10 @@ fn buf_to_binary<'a>(env: Env<'a>, buf: &[u8], scheduler: Scheduler) -> Term<'a>
 /// NIF still loads on 2.15. Reports `None` rather than an error for a name
 /// holding a character above U+00FF; `write_atom_name` reads those a slower
 /// way. Only atoms reach here, so failure has no other cause.
+///
+/// # Safety
+///
+/// `env_raw` must be a live environment that `term_raw` belongs to.
 #[inline]
 unsafe fn atom_to_stack_buf(
     env_raw: *mut ErlNifEnv,
@@ -221,11 +225,16 @@ fn write_wide_atom_name(
     buf: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     let mut bin = MaybeUninit::<ErlNifBinary>::uninit();
+    // SAFETY: `term_raw` belongs to `env_raw`, and `bin` is written on success.
     if unsafe { enif_term_to_binary(env_raw, term_raw, bin.as_mut_ptr()) } == 0 {
         return Err(EncodeError::UnsupportedType);
     }
-    let mut bin = unsafe { bin.assume_init() };
-    let bytes = unsafe { std::slice::from_raw_parts(bin.data, bin.size) };
+    // SAFETY: `enif_term_to_binary` succeeded, so `bin` holds `size` bytes at
+    // `data`, which this function owns until the release below.
+    let (mut bin, bytes) = unsafe {
+        let bin = bin.assume_init();
+        (bin, std::slice::from_raw_parts(bin.data, bin.size))
+    };
 
     // `131`, tag, length, name.
     let name = match bytes {
@@ -246,6 +255,8 @@ fn write_wide_atom_name(
         }
         None => Err(EncodeError::UnsupportedType),
     };
+    // SAFETY: `bin` came from `enif_term_to_binary`, and `bytes` is not used
+    // past this point.
     unsafe { enif_release_binary(&mut bin) };
     result
 }
@@ -261,6 +272,7 @@ fn write_atom_name(
     buf: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     let mut atom_buf = [0u8; 256];
+    // SAFETY: the encoder only passes a term together with its own env.
     let Some(name) = (unsafe { atom_to_stack_buf(env_raw, term_raw, &mut atom_buf) }) else {
         return write_wide_atom_name(env_raw, term_raw, buf);
     };
@@ -345,6 +357,7 @@ fn encode_iodata_impl<'a>(env: Env<'a>, term: Term<'a>, scheduler: Scheduler) ->
         s.null = atoms::nil().as_c_arg();
         let result = match encode_term(env, env_raw, term, s, MAX_DEPTH) {
             Ok(()) => buf_to_binary(env, &s.buf, scheduler),
+            // SAFETY: the reason is an atom, and the raised term is returned.
             Err(e) => unsafe {
                 Term::new(
                     env,
@@ -437,7 +450,10 @@ fn encode_map_key(env_raw: *mut ErlNifEnv, key: Term, s: &mut Scratch) -> Result
     // `enif_inspect_binary` doubles as the type check for the common binary-key
     // path, avoiding a separate `enif_term_type` call.
     let mut bin = MaybeUninit::<ErlNifBinary>::uninit();
+    // SAFETY: on success `bin` describes the binary's bytes, which live as
+    // long as the term they came from.
     if unsafe { enif_inspect_binary(env_raw, raw, bin.as_mut_ptr()) } != 0 {
+        // SAFETY: initialised by the successful call above.
         let slice = unsafe {
             let bin = bin.assume_init();
             std::slice::from_raw_parts(bin.data, bin.size)
@@ -474,16 +490,19 @@ fn encode_list(
     let mut current = term.as_c_arg();
     let mut head: ERL_NIF_TERM = 0;
     let mut tail: ERL_NIF_TERM = 0;
+    // SAFETY: `current` is the list term or a tail read from it, all in `env`.
     while unsafe { enif_get_list_cell(env_raw, current, &mut head, &mut tail) } != 0 {
         if !first {
             s.buf.push(b',');
         }
         first = false;
+        // SAFETY: a list cell's head belongs to the list's env.
         let item = unsafe { Term::new(env, head) };
         encode_term(env, env_raw, item, s, depth - 1)?;
         current = tail;
     }
     // Improper list: the loop ends on a non-cons tail, which must be [].
+    // SAFETY: `current` is a tail read from the list, in `env`.
     if unsafe { enif_is_empty_list(env_raw, current) } == 0 {
         return Err(EncodeError::UnsupportedType);
     }
@@ -498,6 +517,8 @@ fn encode_binary(
     buf: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     let mut bin = MaybeUninit::<ErlNifBinary>::uninit();
+    // SAFETY: on success `bin` describes the binary's bytes, which live as
+    // long as `term`.
     let slice = unsafe {
         if enif_inspect_binary(env_raw, term.as_c_arg(), bin.as_mut_ptr()) == 0 {
             return Err(EncodeError::UnsupportedType);
@@ -515,6 +536,7 @@ fn encode_integer(
     buf: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     let mut n: i64 = 0;
+    // SAFETY: `term` belongs to `env_raw`, and `n` is a local the call writes.
     if unsafe { enif_get_int64(env_raw, term.as_c_arg(), &mut n) } != 0 {
         let mut itoa_buf = itoa::Buffer::new();
         buf.extend_from_slice(itoa_buf.format(n).as_bytes());
@@ -522,6 +544,7 @@ fn encode_integer(
     }
     // Fallback for u64 range (i64::MAX + 1 ..= u64::MAX)
     let mut u: u64 = 0;
+    // SAFETY: as for `enif_get_int64` above.
     if unsafe { enif_get_uint64(env_raw, term.as_c_arg(), &mut u) } != 0 {
         let mut itoa_buf = itoa::Buffer::new();
         buf.extend_from_slice(itoa_buf.format(u).as_bytes());
@@ -542,6 +565,7 @@ fn encode_integer(
 #[inline]
 fn encode_float(env_raw: *mut ErlNifEnv, term: Term, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
     let mut n: f64 = 0.0;
+    // SAFETY: `term` belongs to `env_raw`, and `n` is a local the call writes.
     if unsafe { enif_get_double(env_raw, term.as_c_arg(), &mut n) } == 0 {
         return Err(EncodeError::UnsupportedType);
     }
@@ -570,26 +594,22 @@ fn encode_atom(env_raw: *mut ErlNifEnv, term: Term, s: &mut Scratch) -> Result<(
 }
 
 /// Get a raw tuple slice without allocating a Vec.
-///
-/// # Safety
-///
-/// `env_raw` must be `term`'s environment.
 #[inline]
-unsafe fn get_tuple_raw<'a>(
-    env_raw: *mut ErlNifEnv,
-    term: Term<'a>,
-) -> Result<&'a [ERL_NIF_TERM], EncodeError> {
+fn get_tuple_raw(term: Term<'_>) -> Result<&[ERL_NIF_TERM], EncodeError> {
     let mut arity: c_int = 0;
     let mut array_ptr = MaybeUninit::uninit();
-    if enif_get_tuple(env_raw, term.as_c_arg(), &mut arity, array_ptr.as_mut_ptr()) != 1 {
-        return Err(EncodeError::UnsupportedType);
-    }
     // SAFETY: on success `enif_get_tuple` points `array_ptr` at the tuple's
     // `arity` elements, which live on the heap of `term`'s environment.
-    Ok(std::slice::from_raw_parts(
-        array_ptr.assume_init(),
-        arity as usize,
-    ))
+    unsafe {
+        let env_raw = term.get_env().as_c_arg();
+        if enif_get_tuple(env_raw, term.as_c_arg(), &mut arity, array_ptr.as_mut_ptr()) != 1 {
+            return Err(EncodeError::UnsupportedType);
+        }
+        Ok(std::slice::from_raw_parts(
+            array_ptr.assume_init(),
+            arity as usize,
+        ))
+    }
 }
 
 fn encode_tuple(
@@ -599,8 +619,9 @@ fn encode_tuple(
     s: &mut Scratch,
     depth: u32,
 ) -> Result<(), EncodeError> {
-    let elements = unsafe { get_tuple_raw(env_raw, term)? };
+    let elements = get_tuple_raw(term)?;
     if elements.len() == 1 {
+        // SAFETY: a tuple's elements belong to the tuple's env.
         let inner = unsafe { Term::new(env, elements[0]) };
         if inner.get_type() == TermType::List {
             return encode_proplist(env, env_raw, inner, s, depth);
@@ -624,11 +645,11 @@ fn encode_proplist(
     let mut current = term.as_c_arg();
     let mut head: ERL_NIF_TERM = 0;
     let mut tail: ERL_NIF_TERM = 0;
+    // SAFETY: `current` is the list term or a tail read from it, all in `env`.
     while unsafe { enif_get_list_cell(env_raw, current, &mut head, &mut tail) } != 0 {
-        let pair = unsafe {
-            let pair_term = Term::new(env, head);
-            get_tuple_raw(env_raw, pair_term).map_err(|_| EncodeError::MalformedProplist)?
-        };
+        // SAFETY: a list cell's head belongs to the list's env.
+        let pair_term = unsafe { Term::new(env, head) };
+        let pair = get_tuple_raw(pair_term).map_err(|_| EncodeError::MalformedProplist)?;
         if pair.len() != 2 {
             return Err(EncodeError::MalformedProplist);
         }
@@ -636,14 +657,15 @@ fn encode_proplist(
             s.buf.push(b',');
         }
         first = false;
-        let key = unsafe { Term::new(env, pair[0]) };
-        let val = unsafe { Term::new(env, pair[1]) };
+        // SAFETY: a tuple's elements belong to the tuple's env.
+        let (key, val) = unsafe { (Term::new(env, pair[0]), Term::new(env, pair[1])) };
         encode_map_key(env_raw, key, s)?;
         s.buf.push(b':');
         encode_term(env, env_raw, val, s, depth - 1)?;
         current = tail;
     }
     // Improper list: the loop ends on a non-cons tail, which must be [].
+    // SAFETY: `current` is a tail read from the list, in `env`.
     if unsafe { enif_is_empty_list(env_raw, current) } == 0 {
         return Err(EncodeError::MalformedProplist);
     }

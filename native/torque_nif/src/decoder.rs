@@ -536,6 +536,8 @@ fn extracted_str_term(
         if let Some(offset) = (s.as_ptr() as usize).checked_sub(input.as_ptr() as usize) {
             if let Some(room) = input.len().checked_sub(offset) {
                 if s.len() <= room {
+                    // SAFETY: `input_term` is the binary `input` reads, and
+                    // the slice was just checked to lie inside it.
                     return unsafe {
                         enif_make_sub_binary(env.as_c_arg(), input_term, offset, s.len())
                     };

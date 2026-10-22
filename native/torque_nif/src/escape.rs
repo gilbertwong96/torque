@@ -135,6 +135,11 @@ unsafe fn escape_prefix(src: *const u8, len: usize, dst: *mut u8) -> usize {
 // UTF-8 validation helpers
 // ---------------------------------------------------------------------------
 
+/// Width of the UTF-8 sequence starting at `pos`.
+///
+/// # Safety
+///
+/// `src` must be readable for `len` bytes, and `pos < len`.
 #[inline]
 unsafe fn validate_utf8_seq(src: *const u8, pos: usize, len: usize) -> Result<usize, InvalidUtf8> {
     let b0 = *src.add(pos);
@@ -201,6 +206,7 @@ pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
     }
     buf.reserve(len * 6 + 32);
     let base = buf.len();
+    // SAFETY: the reserve covers the kernels' `6 * len` bound past `base`.
     let written = unsafe {
         let dst = buf.as_mut_ptr().add(base);
         let done = if len < SHORT_STRING {
@@ -214,6 +220,7 @@ pub(crate) fn escape_to_vec(bytes: &[u8], buf: &mut Vec<u8>) {
             done + escape_dispatch(bytes.as_ptr().add(done), len - done, dst.add(done))
         }
     };
+    // SAFETY: the kernels initialised `written` bytes past `base`.
     unsafe { buf.set_len(base + written) };
 }
 
@@ -366,6 +373,10 @@ unsafe fn escape_sse2(src: *const u8, len: usize, dst: *mut u8) -> usize {
     out_pos + escape_scalar(src.add(in_pos), len - in_pos, dst.add(out_pos))
 }
 
+/// # Safety
+///
+/// `src` must be readable for `len` bytes and `dst` writable for `6 * len`
+/// bytes.
 unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
@@ -396,6 +407,9 @@ unsafe fn escape_scalar(src: *const u8, len: usize, dst: *mut u8) -> usize {
     out_pos
 }
 
+/// # Safety
+///
+/// As for `escape_scalar`.
 unsafe fn escape_dispatch(src: *const u8, len: usize, dst: *mut u8) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
@@ -429,6 +443,8 @@ pub(crate) fn write_json_string(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(), I
     let len = bytes.len();
     buf.reserve(len * 6 + 34);
     let base = buf.len();
+    // SAFETY: the reserve covers both quotes and the kernels' `6 * len` bound
+    // past `base`, and `set_len` covers only the bytes written.
     unsafe {
         let dst = buf.as_mut_ptr().add(base);
         *dst = b'"';
@@ -652,6 +668,11 @@ unsafe fn validate_escape_sse2(
 /// multi-byte characters (CJK, emoji) one byte at a time. One SIMD validation
 /// pass followed by the escape-only kernel, which copies high bytes through,
 /// keeps both at vector width.
+///
+/// # Safety
+///
+/// `src` must be readable for `len` bytes, `in_pos <= len`, and `dst` writable
+/// for `out_pos + 6 * (len - in_pos)` bytes.
 #[inline(never)]
 unsafe fn finish_non_ascii(
     src: *const u8,
@@ -671,6 +692,10 @@ unsafe fn finish_non_ascii(
 // Scalar — validating
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// `src` must be readable for `len` bytes and `dst` writable for `6 * len`
+/// bytes.
 unsafe fn validate_escape_scalar(
     src: *const u8,
     len: usize,
@@ -723,6 +748,9 @@ unsafe fn validate_escape_scalar(
 // Dispatch — validating
 // ---------------------------------------------------------------------------
 
+/// # Safety
+///
+/// As for `validate_escape_scalar`.
 unsafe fn validate_escape_dispatch(
     src: *const u8,
     len: usize,
@@ -761,6 +789,7 @@ mod tests {
 
     fn prefix_of(bytes: &[u8]) -> (usize, Vec<u8>) {
         let mut dst = vec![0xAAu8; bytes.len() + 8];
+        // SAFETY: `dst` has room for `bytes.len()` bytes.
         let n = unsafe { escape_prefix(bytes.as_ptr(), bytes.len(), dst.as_mut_ptr()) };
         (n, dst)
     }
@@ -859,6 +888,7 @@ mod tests {
 
         fn escape_with(kernel: Escape, input: &[u8]) -> Vec<u8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
+            // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
             let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr()) };
             dst.truncate(n);
             dst
@@ -866,6 +896,7 @@ mod tests {
 
         fn validate_with(kernel: Validate, input: &[u8]) -> Result<Vec<u8>, InvalidUtf8> {
             let mut dst = vec![0u8; input.len() * 6 + 64];
+            // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
             let n = unsafe { kernel(input.as_ptr(), input.len(), dst.as_mut_ptr())? };
             dst.truncate(n);
             Ok(dst)
@@ -989,21 +1020,22 @@ mod tests {
 
     #[test]
     fn the_kernels_write_nothing_past_six_times_the_input() {
-        type Kernel = fn(*const u8, usize, *mut u8) -> usize;
+        type Kernel = unsafe fn(*const u8, usize, *mut u8) -> usize;
+        unsafe fn validate(s: *const u8, l: usize, d: *mut u8) -> usize {
+            validate_escape_dispatch(s, l, d).expect("ascii")
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe fn validate_sse2(s: *const u8, l: usize, d: *mut u8) -> usize {
+            validate_escape_sse2(s, l, d).expect("ascii")
+        }
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut kernels: Vec<(&str, Kernel)> = vec![
-            ("escape", |s, l, d| unsafe { escape_dispatch(s, l, d) }),
-            ("validate", |s, l, d| unsafe {
-                validate_escape_dispatch(s, l, d).expect("ascii")
-            }),
-        ];
+        let mut kernels: Vec<(&str, Kernel)> =
+            vec![("escape", escape_dispatch), ("validate", validate)];
         // Dispatch prefers AVX2, which reaches SSE2 only for its tail.
         #[cfg(target_arch = "x86_64")]
         {
-            kernels.push(("escape_sse2", |s, l, d| unsafe { escape_sse2(s, l, d) }));
-            kernels.push(("validate_sse2", |s, l, d| unsafe {
-                validate_escape_sse2(s, l, d).expect("ascii")
-            }));
+            kernels.push(("escape_sse2", escape_sse2));
+            kernels.push(("validate_sse2", validate_sse2));
         }
 
         for len in 0..200usize {
@@ -1019,7 +1051,8 @@ mod tests {
                 for (name, kernel) in &kernels {
                     let bound = 6 * len;
                     let mut dst = vec![0xAAu8; bound + 64];
-                    let n = kernel(input.as_ptr(), len, dst.as_mut_ptr());
+                    // SAFETY: `dst` holds the `6 * len` bytes the kernels may write.
+                    let n = unsafe { kernel(input.as_ptr(), len, dst.as_mut_ptr()) };
                     assert_eq!(&dst[..n], &want[..], "{name}: len {len} period {period}");
                     assert!(
                         dst[bound..].iter().all(|&b| b == 0xAA),

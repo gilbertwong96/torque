@@ -44,6 +44,7 @@ pub fn value_to_term<'a>(
     nodes: &mut usize,
 ) -> Option<Term<'a>> {
     match value.get_type() {
+        // SAFETY: `null` is an atom, valid in every env.
         JsonType::Null => Some(unsafe { Term::new(env, null) }),
         JsonType::Boolean => Some(if value.as_bool().expect("get_type() said Boolean") {
             atoms::r#true().to_term(env)
@@ -120,6 +121,7 @@ pub fn value_to_term<'a>(
                         std::slice::from_raw_parts(vals.as_ptr() as *const ERL_NIF_TERM, count),
                     )
                 };
+                // SAFETY: `make_map` builds the map in `env`.
                 Some(unsafe { Term::new(env, make_map(env, keys, vals)) })
             } else {
                 let mut keys: Vec<ERL_NIF_TERM> = Vec::with_capacity(count);
@@ -128,6 +130,7 @@ pub fn value_to_term<'a>(
                     keys.push(make_binary_term(env, k).as_c_arg());
                     vals.push(value_to_term(env, v, null, child_depth, nodes)?.as_c_arg());
                 }
+                // SAFETY: `make_map` builds the map in `env`.
                 Some(unsafe { Term::new(env, make_map(env, &keys, &vals)) })
             }
         }

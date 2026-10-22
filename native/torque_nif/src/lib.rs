@@ -1,3 +1,5 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use sonic_rs::extract::{Keys, Validate};
 
 mod atoms;
