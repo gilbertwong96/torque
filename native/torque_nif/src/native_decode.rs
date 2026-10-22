@@ -149,12 +149,17 @@ struct KeyOrd {
 
 impl KeyOrd {
     /// Erlang orders binaries by bytes, then length, like `[u8]`'s `Ord`.
+    ///
+    /// # Safety
+    ///
+    /// Neither `ptr` may be null.
     #[inline]
-    fn lt(&self, other: &KeyOrd) -> bool {
+    unsafe fn lt(&self, other: &KeyOrd) -> bool {
         if self.prefix != other.prefix {
             return self.prefix < other.prefix;
         }
-        // SAFETY: both point into the input binary, which outlives the call.
+        // SAFETY: non-null, so both point into the input binary, which
+        // outlives the call.
         unsafe {
             std::slice::from_raw_parts(self.ptr, self.len)
                 < std::slice::from_raw_parts(other.ptr, other.len)
@@ -404,7 +409,8 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
             || (w[0].prefix == w[1].prefix
                 && !w[0].ptr.is_null()
                 && !w[1].ptr.is_null()
-                && w[0].lt(&w[1]))
+                // SAFETY: both checked non-null just above.
+                && unsafe { w[0].lt(&w[1]) })
     });
     if ordered || ords.iter().any(|o| o.ptr.is_null()) {
         return None;
@@ -413,7 +419,8 @@ fn member_order(ords: &[KeyOrd]) -> Option<[u8; FLATMAP_LIMIT]> {
     let mut moved = false;
     for i in 0..ords.len() {
         let mut j = i;
-        while j > 0 && ords[i].lt(&ords[perm[j - 1] as usize]) {
+        // SAFETY: members with a null `ptr` returned above.
+        while j > 0 && unsafe { ords[i].lt(&ords[perm[j - 1] as usize]) } {
             perm[j] = perm[j - 1];
             j -= 1;
         }
