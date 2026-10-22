@@ -61,6 +61,7 @@ impl AtomNames {
     }
 
     /// Appends `term`'s quoted name when it is a cached atom.
+    #[must_use]
     #[inline(always)]
     fn write_cached(&self, term: ERL_NIF_TERM, buf: &mut Vec<u8>) -> bool {
         let entry = &self.slots[Self::slot(term)];
