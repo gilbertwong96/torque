@@ -279,17 +279,17 @@ fn parse_opts_dirty<'a>(
 fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
     let ok_raw = atoms::ok().as_c_arg();
     let err_raw = atoms::error().as_c_arg();
-    let nsf_raw = atoms::no_such_field().as_c_arg();
-    let ntd_raw = atoms::nesting_too_deep().as_c_arg();
+    let no_such_field = atoms::no_such_field().as_c_arg();
+    let nesting_too_deep = atoms::nesting_too_deep().as_c_arg();
     let mut nodes = 0usize;
     let result = match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => {
             match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, &mut nodes) {
                 Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
-                None => make_tuple2(env, err_raw, ntd_raw),
+                None => make_tuple2(env, err_raw, nesting_too_deep),
             }
         }
-        None => make_tuple2(env, err_raw, nsf_raw),
+        None => make_tuple2(env, err_raw, no_such_field),
     };
     consume_timeslice_nodes(env, nodes);
     result
@@ -299,8 +299,8 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
 struct ResultAtoms {
     ok: ERL_NIF_TERM,
     err: ERL_NIF_TERM,
-    nsf: ERL_NIF_TERM,
-    ntd: ERL_NIF_TERM,
+    no_such_field: ERL_NIF_TERM,
+    nesting_too_deep: ERL_NIF_TERM,
 }
 
 #[inline]
@@ -314,9 +314,9 @@ fn get_one_result(
     match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, nodes) {
             Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
-            None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
+            None => make_tuple2(env, atoms.err, atoms.nesting_too_deep).as_c_arg(),
         },
-        None => make_tuple2(env, atoms.err, atoms.nsf).as_c_arg(),
+        None => make_tuple2(env, atoms.err, atoms.no_such_field).as_c_arg(),
     }
 }
 
@@ -329,8 +329,8 @@ fn get_many<'a>(
     let result_atoms = ResultAtoms {
         ok: atoms::ok().as_c_arg(),
         err: atoms::error().as_c_arg(),
-        nsf: atoms::no_such_field().as_c_arg(),
-        ntd: atoms::nesting_too_deep().as_c_arg(),
+        no_such_field: atoms::no_such_field().as_c_arg(),
+        nesting_too_deep: atoms::nesting_too_deep().as_c_arg(),
     };
     let mut nodes = 0usize;
     let mut acc = TermAcc::new();

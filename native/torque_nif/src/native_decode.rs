@@ -222,8 +222,8 @@ pub(crate) enum Strings {
     Copy,
 }
 
-pub(crate) struct TermBuilder<'a, 'b> {
-    env: Env<'a>,
+pub(crate) struct TermBuilder<'env, 'bufs> {
+    env: Env<'env>,
     input: InputRef,
     strings: Strings,
     /// Bytes of strings borrowed from the input. Recent ERTS releases copy
@@ -235,22 +235,22 @@ pub(crate) struct TermBuilder<'a, 'b> {
     dropped_members: bool,
     /// Postfix value stack: completed terms plus the open containers' children.
     /// Borrowed from a reused thread-local buffer (see `DECODE_BUFS`).
-    values: &'b mut Vec<ERL_NIF_TERM>,
+    values: &'bufs mut Vec<ERL_NIF_TERM>,
     /// Where each currently-open container's children begin in `values`,
     /// and its members' keys in `key_terms` and `ords`.
-    frames: &'b mut Vec<Frame>,
+    frames: &'bufs mut Vec<Frame>,
     /// Open objects' key terms, kept apart from `values` so an object's keys
     /// and values reach `enif_make_map_from_arrays` without being copied.
-    key_terms: &'b mut Vec<ERL_NIF_TERM>,
-    ords: &'b mut Vec<KeyOrd>,
-    keys: &'b mut KeyCache,
+    key_terms: &'bufs mut Vec<ERL_NIF_TERM>,
+    ords: &'bufs mut Vec<KeyOrd>,
+    keys: &'bufs mut KeyCache,
     /// The term JSON null becomes.
     null: ERL_NIF_TERM,
     empty_map: ERL_NIF_TERM,
     too_deep: bool,
 }
 
-impl<'a, 'b> TermBuilder<'a, 'b> {
+impl<'env, 'bufs> TermBuilder<'env, 'bufs> {
     /// Terms of the values parsed so far, in order. Each parse driven through
     /// the builder leaves exactly one.
     #[inline]
@@ -529,7 +529,7 @@ fn bignum_term_large(env: Env, raw: &str) -> Option<ERL_NIF_TERM> {
     rustler::BigInt::parse_bytes(raw.as_bytes(), 10).map(|big| big.encode(env).as_c_arg())
 }
 
-impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
+impl<'de, 'env, 'bufs> JsonVisitor<'de> for TermBuilder<'env, 'bufs> {
     #[inline]
     fn visit_dom_start(&mut self) -> bool {
         true
@@ -695,13 +695,13 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 /// Runs `f` with a term builder over the binary `input_term`, whose bytes are
 /// `bytes`, on this scheduler thread's reused stacks and key cache. JSON null
 /// becomes `null`.
-pub(crate) fn with_term_builder<'a, R>(
-    env: Env<'a>,
+pub(crate) fn with_term_builder<'env, R>(
+    env: Env<'env>,
     input_term: ERL_NIF_TERM,
     bytes: &[u8],
     strings: Strings,
     null: ERL_NIF_TERM,
-    f: impl for<'b> FnOnce(&mut TermBuilder<'a, 'b>) -> R,
+    f: impl for<'bufs> FnOnce(&mut TermBuilder<'env, 'bufs>) -> R,
 ) -> R {
     let input = InputRef {
         term: input_term,
