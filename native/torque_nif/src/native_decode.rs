@@ -255,7 +255,7 @@ impl<'env, 'bufs> TermBuilder<'env, 'bufs> {
     /// the builder leaves exactly one.
     #[inline]
     pub(crate) fn roots(&self) -> &[ERL_NIF_TERM] {
-        debug_assert!(self.frames.is_empty());
+        debug_assert!(self.frames.is_empty(), "a container is still open");
         self.values
     }
 
