@@ -10,8 +10,7 @@
 //! result. After a successful parse the stack holds exactly the root term.
 
 use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_from_array, enif_make_map_put,
-    enif_make_new_map, enif_make_sub_binary, enif_make_uint64, enif_system_info, ErlNifSysInfo,
+    enif_make_map_put, enif_make_new_map, enif_make_sub_binary, enif_system_info, ErlNifSysInfo,
     ERL_NIF_TERM,
 };
 use rustler::{Encoder, Env, NewBinary, Term};
@@ -21,7 +20,7 @@ use std::sync::OnceLock;
 
 use crate::atoms;
 use crate::decoder::parse_error_term;
-use crate::nif_util::{make_tuple2, map_last_wins, try_make_map, FLATMAP_LIMIT};
+use crate::nif_util::{make_list, make_tuple2, map_last_wins, try_make_map, FLATMAP_LIMIT};
 use crate::types::MAX_DEPTH;
 
 /// Cap on each retained thread-local buffer, so a one-off huge document
@@ -550,22 +549,19 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
 
     #[inline]
     fn visit_i64(&mut self, val: i64) -> bool {
-        let t = unsafe { enif_make_int64(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
     #[inline]
     fn visit_u64(&mut self, val: u64) -> bool {
-        let t = unsafe { enif_make_uint64(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
     #[inline]
     fn visit_f64(&mut self, val: f64) -> bool {
-        let t = unsafe { enif_make_double(self.env.as_c_arg(), val) };
-        self.push(t);
+        self.push(val.encode(self.env).as_c_arg());
         true
     }
 
@@ -573,8 +569,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
     /// raw digits.
     #[inline]
     fn visit_overflow_int(&mut self, raw: &str, as_f64: f64) -> bool {
-        let t = bignum_term(self.env, raw)
-            .unwrap_or_else(|| unsafe { enif_make_double(self.env.as_c_arg(), as_f64) });
+        let t = bignum_term(self.env, raw).unwrap_or_else(|| as_f64.encode(self.env).as_c_arg());
         self.push(t);
         true
     }
@@ -638,10 +633,7 @@ impl<'de, 'a, 'b> JsonVisitor<'de> for TermBuilder<'a, 'b> {
             Some(f) => f.values,
             None => return false,
         };
-        let count = (self.values.len() - start) as u32;
-        let list = unsafe {
-            enif_make_list_from_array(self.env.as_c_arg(), self.values[start..].as_ptr(), count)
-        };
+        let list = make_list(self.env, &self.values[start..]).as_c_arg();
         self.values.truncate(start);
         self.values.push(list);
         true

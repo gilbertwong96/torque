@@ -1,10 +1,14 @@
+//! Term construction helpers. Like rustler's `Term::new`, they take raw
+//! `ERL_NIF_TERM`s on trust: every raw term passed in must belong to the `env`
+//! passed with it.
+
 use std::mem::MaybeUninit;
 
 use rustler::sys::{
-    enif_get_map_size, enif_make_map_from_arrays, enif_make_map_put, enif_make_new_map,
-    enif_make_tuple_from_array, enif_map_iterator_create, enif_map_iterator_destroy,
-    enif_map_iterator_get_pair, enif_map_iterator_next, ErlNifMapIterator, ErlNifMapIteratorEntry,
-    ERL_NIF_TERM,
+    enif_get_map_size, enif_make_list_from_array, enif_make_map_from_arrays, enif_make_map_put,
+    enif_make_new_map, enif_make_tuple_from_array, enif_map_iterator_create,
+    enif_map_iterator_destroy, enif_map_iterator_get_pair, enif_map_iterator_next,
+    ErlNifMapIterator, ErlNifMapIteratorEntry, ERL_NIF_TERM,
 };
 use rustler::{Env, Term};
 
@@ -12,10 +16,23 @@ use rustler::{Env, Term};
 #[inline]
 pub fn make_tuple2<'a>(env: Env<'a>, a: ERL_NIF_TERM, b: ERL_NIF_TERM) -> Term<'a> {
     let arr: [ERL_NIF_TERM; 2] = [a, b];
+    // SAFETY: `arr` is live for the call, and the tuple is built in `env`.
     unsafe {
         Term::new(
             env,
             enif_make_tuple_from_array(env.as_c_arg(), arr.as_ptr(), 2),
+        )
+    }
+}
+
+/// Build a list from raw NIF terms.
+#[inline]
+pub fn make_list<'a>(env: Env<'a>, terms: &[ERL_NIF_TERM]) -> Term<'a> {
+    // SAFETY: `terms` is live for the call, and the list is built in `env`.
+    unsafe {
+        Term::new(
+            env,
+            enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), terms.len() as u32),
         )
     }
 }

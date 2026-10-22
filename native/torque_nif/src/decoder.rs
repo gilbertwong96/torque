@@ -1,12 +1,9 @@
 use crate::atoms;
 use crate::native_decode::{self, builder_error_term, with_term_builder, Strings, TermBuilder};
-use crate::nif_util::{make_tuple2, timeslice_percent, REDUCTION_COUNT};
+use crate::nif_util::{make_list, make_tuple2, timeslice_percent, REDUCTION_COUNT};
 use crate::types::{value_to_term, MAX_DEPTH};
 use crate::ParsedDocument;
-use rustler::sys::{
-    enif_make_double, enif_make_int64, enif_make_list_cell, enif_make_list_from_array,
-    enif_make_sub_binary, enif_make_uint64, ERL_NIF_TERM,
-};
+use rustler::sys::{enif_make_list_cell, enif_make_sub_binary, ERL_NIF_TERM};
 use rustler::{
     schedule, Atom, Binary, Encoder, Env, ListIterator, NewBinary, NifResult, ResourceArc, Term,
 };
@@ -88,12 +85,7 @@ impl TermAcc {
             Some(v) => v.as_slice(),
             None => &self.stack[..self.count],
         };
-        unsafe {
-            Term::new(
-                env,
-                enif_make_list_from_array(env.as_c_arg(), terms.as_ptr(), self.count as u32),
-            )
-        }
+        make_list(env, terms)
     }
 }
 
@@ -356,15 +348,7 @@ fn get_many<'a>(
 #[rustler::nif]
 fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
     match pointer_lookup(&doc.value, path, doc.keys).and_then(|v| v.as_array()) {
-        Some(array) => {
-            let len = array.len();
-            unsafe {
-                Term::new(
-                    env,
-                    rustler::sys::enif_make_uint64(env.as_c_arg(), len as u64),
-                )
-            }
-        }
+        Some(array) => (array.len() as u64).encode(env),
         _ => doc.missing.to_term(env),
     }
 }
@@ -693,8 +677,7 @@ fn do_parse_get_many_nil<'a>(
             let rebuilt = (!borrow && builder.borrowed() > 0)
                 .then(|| rebuild_copied(bytes, &compiled.plan, &values, builder));
             // Consed from the back, so the list needs no staging buffer.
-            let mut list =
-                unsafe { enif_make_list_from_array(env.as_c_arg(), std::ptr::null(), 0) };
+            let mut list = make_list(env, &[]).as_c_arg();
             for (slot, v) in values.iter().enumerate().rev() {
                 let t = match v {
                     // A string the parser never had to unescape is still in the
@@ -713,9 +696,9 @@ fn do_parse_get_many_nil<'a>(
                             None => builder.roots()[*root],
                         }
                     }
-                    Some(Extracted::U64(n)) => unsafe { enif_make_uint64(env.as_c_arg(), *n) },
-                    Some(Extracted::I64(n)) => unsafe { enif_make_int64(env.as_c_arg(), *n) },
-                    Some(Extracted::F64(n)) => unsafe { enif_make_double(env.as_c_arg(), *n) },
+                    Some(Extracted::U64(n)) => n.encode(env).as_c_arg(),
+                    Some(Extracted::I64(n)) => n.encode(env).as_c_arg(),
+                    Some(Extracted::F64(n)) => n.encode(env).as_c_arg(),
                     Some(Extracted::BigInt(raw)) => {
                         native_decode::bignum_term(env, raw).unwrap_or(missing)
                     }
@@ -727,6 +710,7 @@ fn do_parse_get_many_nil<'a>(
                     Some(Extracted::Null) => null,
                     None => missing,
                 };
+                // SAFETY: `t` and `list` were built in `env`.
                 list = unsafe { enif_make_list_cell(env.as_c_arg(), t, list) };
             }
             make_tuple2(env, atoms::ok().as_c_arg(), list)
