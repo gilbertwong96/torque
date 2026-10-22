@@ -1,3 +1,5 @@
+use sonic_rs::extract::{Keys, Validate};
+
 mod atoms;
 mod decoder;
 mod encoder;
@@ -11,7 +13,7 @@ mod types;
 /// Erlang.
 pub struct ParsedDocument {
     pub value: sonic_rs::Value,
-    pub unique_keys: bool,
+    pub keys: Keys,
     pub null: rustler::Atom,
     pub missing: rustler::Atom,
 }
@@ -31,9 +33,9 @@ pub enum PathSeg {
 pub struct CompiledPaths {
     pub paths: Vec<Vec<PathSeg>>,
     pub plan: sonic_rs::extract::ExtractPlan,
-    pub unique_keys: bool,
+    pub keys: Keys,
     /// Whether fused extraction validates syntax in unselected regions.
-    pub validate: bool,
+    pub validate: Validate,
     /// As in `ParsedDocument`, for fused extraction.
     pub null: rustler::Atom,
     pub missing: rustler::Atom,

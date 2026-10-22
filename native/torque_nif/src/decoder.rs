@@ -112,19 +112,28 @@ fn array_index(token: &str) -> Option<usize> {
 
 /// Looks up `key` in an object.
 ///
-/// When `unique_keys` is true, uses sonic-rs's internal index (fast).
-/// Otherwise, does a reverse linear scan so that the last value wins,
-/// matching the duplicate-key behaviour of `value_to_term` / `build_map_dedup`.
+/// With unique keys, uses sonic-rs's internal index (fast). Otherwise, does a
+/// reverse linear scan so that the last value wins, matching the duplicate-key
+/// behaviour of `value_to_term` / `build_map_dedup`.
 #[inline]
 fn object_get<'v>(
     value: &'v sonic_rs::Value,
     key: &str,
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
+    match keys {
+        Keys::Unique => value.get(key),
+        Keys::Repeatable => value.as_object()?.get_last(&key),
+    }
+}
+
+/// The `unique_keys` option as the key policy.
+#[inline]
+fn key_policy(unique_keys: bool) -> Keys {
     if unique_keys {
-        value.get(key)
+        Keys::Unique
     } else {
-        value.as_object()?.get_last(&key)
+        Keys::Repeatable
     }
 }
 
@@ -154,7 +163,7 @@ fn unescape(segment: &str) -> Option<Cow<'_, str>> {
 fn pointer_lookup<'v>(
     value: &'v sonic_rs::Value,
     path: &str,
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
     let bytes = path.as_bytes();
     if bytes.is_empty() {
@@ -175,21 +184,21 @@ fn pointer_lookup<'v>(
                 continue;
             }
         }
-        current = object_get(current, &unescape(segment)?, unique_keys)?;
+        current = object_get(current, &unescape(segment)?, keys)?;
     }
     Some(current)
 }
 
 fn do_parse(
     bytes: &[u8],
-    unique_keys: bool,
+    keys: Keys,
     null: Atom,
     missing: Atom,
 ) -> Result<ResourceArc<ParsedDocument>, sonic_rs::Error> {
     let value = sonic_rs::from_slice::<sonic_rs::Value>(bytes)?;
     Ok(ResourceArc::new(ParsedDocument {
         value,
-        unique_keys,
+        keys,
         null,
         missing,
     }))
@@ -216,7 +225,12 @@ pub(crate) fn parse_error_term<'a>(env: Env<'a>, err: &sonic_rs::Error) -> Term<
 
 #[rustler::nif]
 fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
+    match do_parse(
+        json.as_slice(),
+        Keys::Repeatable,
+        atoms::nil(),
+        atoms::nil(),
+    ) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -227,7 +241,12 @@ fn parse<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_dirty<'a>(env: Env<'a>, json: Binary) -> Term<'a> {
-    match do_parse(json.as_slice(), false, atoms::nil(), atoms::nil()) {
+    match do_parse(
+        json.as_slice(),
+        Keys::Repeatable,
+        atoms::nil(),
+        atoms::nil(),
+    ) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
@@ -241,7 +260,7 @@ fn parse_opts<'a>(
     null: Atom,
     missing: Atom,
 ) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys, null, missing) {
+    match do_parse(json.as_slice(), key_policy(unique_keys), null, missing) {
         Ok(resource) => {
             schedule::consume_timeslice(env, timeslice_percent(json.len()));
             make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg())
@@ -258,7 +277,7 @@ fn parse_opts_dirty<'a>(
     null: Atom,
     missing: Atom,
 ) -> Term<'a> {
-    match do_parse(json.as_slice(), unique_keys, null, missing) {
+    match do_parse(json.as_slice(), key_policy(unique_keys), null, missing) {
         Ok(resource) => make_tuple2(env, atoms::ok().as_c_arg(), resource.encode(env).as_c_arg()),
         Err(e) => parse_error_term(env, &e),
     }
@@ -271,7 +290,7 @@ fn get<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'
     let nsf_raw = atoms::no_such_field().as_c_arg();
     let ntd_raw = atoms::nesting_too_deep().as_c_arg();
     let mut nodes = 0usize;
-    let result = match pointer_lookup(&doc.value, path, doc.unique_keys) {
+    let result = match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => {
             match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, &mut nodes) {
                 Some(term) => make_tuple2(env, ok_raw, term.as_c_arg()),
@@ -300,7 +319,7 @@ fn get_one_result(
     atoms: &ResultAtoms,
     nodes: &mut usize,
 ) -> ERL_NIF_TERM {
-    match pointer_lookup(&doc.value, path, doc.unique_keys) {
+    match pointer_lookup(&doc.value, path, doc.keys) {
         Some(value) => match value_to_term(env, value, doc.null.as_c_arg(), MAX_DEPTH, nodes) {
             Some(term) => make_tuple2(env, atoms.ok, term.as_c_arg()).as_c_arg(),
             None => make_tuple2(env, atoms.err, atoms.ntd).as_c_arg(),
@@ -336,7 +355,7 @@ fn get_many<'a>(
 
 #[rustler::nif]
 fn array_length<'a>(env: Env<'a>, doc: ResourceArc<ParsedDocument>, path: &str) -> Term<'a> {
-    match pointer_lookup(&doc.value, path, doc.unique_keys).and_then(|v| v.as_array()) {
+    match pointer_lookup(&doc.value, path, doc.keys).and_then(|v| v.as_array()) {
         Some(array) => {
             let len = array.len();
             unsafe {
@@ -416,6 +435,7 @@ fn decode_strings(copy_strings: bool) -> Strings {
 // per-path string work — roughly halving extraction time — and fusing the parse
 // and the extraction into one NIF call avoids materializing a document handle.
 use crate::{CompiledPaths, PathSeg};
+use sonic_rs::extract::{Keys, Validate};
 
 /// Pre-split a single JSON Pointer into segments. A numeric segment is stored as
 /// `Num`, keeping both the parsed index and the literal key so the lookup can
@@ -469,8 +489,12 @@ fn compile_paths<'a>(
     Ok(ResourceArc::new(CompiledPaths {
         paths: out,
         plan,
-        unique_keys,
-        validate,
+        keys: key_policy(unique_keys),
+        validate: if validate {
+            Validate::Yes
+        } else {
+            Validate::No
+        },
         null,
         missing,
     })
@@ -502,7 +526,7 @@ fn extract_compiled<'a>(
     let missing = doc.missing.as_c_arg();
     let mut acc = TermAcc::with_hint(compiled.paths.len());
     for segs in compiled.paths.iter() {
-        let r = match pointer_lookup_compiled(&doc.value, segs, compiled.unique_keys) {
+        let r = match pointer_lookup_compiled(&doc.value, segs, compiled.keys) {
             Some(v) => value_to_term(env, v, null, MAX_DEPTH, nodes)
                 .map(|t| t.as_c_arg())
                 .unwrap_or(missing),
@@ -628,18 +652,7 @@ fn do_parse_get_many_nil<'a>(
     compiled: &CompiledPaths,
     nodes: &mut usize,
 ) -> Term<'a> {
-    use sonic_rs::extract::{Extracted, Keys, Validate};
-
-    let validate = if compiled.validate {
-        Validate::Yes
-    } else {
-        Validate::No
-    };
-    let keys = if compiled.unique_keys {
-        Keys::Unique
-    } else {
-        Keys::Repeatable
-    };
+    use sonic_rs::extract::Extracted;
 
     with_term_builder(
         env,
@@ -651,8 +664,8 @@ fn do_parse_get_many_nil<'a>(
             let values = match sonic_rs::extract::extract_with(
                 bytes,
                 &compiled.plan,
-                validate,
-                keys,
+                compiled.validate,
+                compiled.keys,
                 builder,
             ) {
                 Ok(values) => values,
@@ -751,17 +764,17 @@ fn parse_get_many_nil_dirty<'a>(
 fn pointer_lookup_compiled<'v>(
     value: &'v sonic_rs::Value,
     segs: &[PathSeg],
-    unique_keys: bool,
+    keys: Keys,
 ) -> Option<&'v sonic_rs::Value> {
     let mut current = value;
     for seg in segs {
         current = match seg {
-            PathSeg::Key(k) => object_get(current, k, unique_keys)?,
+            PathSeg::Key(k) => object_get(current, k, keys)?,
             PathSeg::Num { idx, key } => {
                 if current.is_array() {
                     current.get(*idx)?
                 } else {
-                    object_get(current, key, unique_keys)?
+                    object_get(current, key, keys)?
                 }
             }
         };
@@ -795,7 +808,7 @@ fn get_many_nil<'a>(
     for path_term in paths {
         // Non-binary (or non-UTF-8) path entries are caller bugs: badarg.
         let path: &str = path_term.decode()?;
-        let r = match pointer_lookup(&doc.value, path, doc.unique_keys) {
+        let r = match pointer_lookup(&doc.value, path, doc.keys) {
             Some(value) => match value_to_term(env, value, null, MAX_DEPTH, &mut nodes) {
                 Some(term) => term.as_c_arg(),
                 None => missing,
