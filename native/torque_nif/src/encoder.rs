@@ -557,16 +557,22 @@ fn encode_atom(env_raw: *mut ErlNifEnv, term: Term, s: &mut Scratch) -> Result<(
 }
 
 /// Get a raw tuple slice without allocating a Vec.
+///
+/// # Safety
+///
+/// `env_raw` must be `term`'s environment.
 #[inline]
 unsafe fn get_tuple_raw<'a>(
     env_raw: *mut ErlNifEnv,
-    term: Term,
+    term: Term<'a>,
 ) -> Result<&'a [ERL_NIF_TERM], EncodeError> {
     let mut arity: c_int = 0;
     let mut array_ptr = MaybeUninit::uninit();
     if enif_get_tuple(env_raw, term.as_c_arg(), &mut arity, array_ptr.as_mut_ptr()) != 1 {
         return Err(EncodeError::UnsupportedType);
     }
+    // SAFETY: on success `enif_get_tuple` points `array_ptr` at the tuple's
+    // `arity` elements, which live on the heap of `term`'s environment.
     Ok(std::slice::from_raw_parts(
         array_ptr.assume_init(),
         arity as usize,
