@@ -35,35 +35,6 @@ pub fn timeslice_percent(bytes: usize) -> i32 {
 /// are hash maps.
 pub const FLATMAP_LIMIT: usize = 32;
 
-/// Build a map from key and value arrays.
-///
-/// Returns false when ERTS rejects the members, or when duplicate keys
-/// collapsed the map size: before erlang/otp#10976, `enif_make_map_from_arrays`
-/// reported success for a hashmap-sized input with duplicate keys and returned
-/// an invalid map.
-///
-/// # Safety
-///
-/// `keys` and `vals` must point to `count` initialized terms, and `map` to a
-/// writable term.
-#[inline]
-pub unsafe fn map_from_arrays(
-    env: Env,
-    keys: *const ERL_NIF_TERM,
-    vals: *const ERL_NIF_TERM,
-    count: usize,
-    map: *mut ERL_NIF_TERM,
-) -> bool {
-    if enif_make_map_from_arrays(env.as_c_arg(), keys, vals, count, map) == 0 {
-        return false;
-    }
-    if count <= FLATMAP_LIMIT {
-        return true;
-    }
-    let mut size = 0;
-    enif_get_map_size(env.as_c_arg(), *map, &mut size) != 0 && size == count
-}
-
 /// Build a map from an object's keys and values. Duplicate keys fall back to
 /// inserting the members in order, so the last value for a key wins.
 ///
@@ -78,16 +49,40 @@ pub fn make_map(env: Env, keys: &[ERL_NIF_TERM], vals: &[ERL_NIF_TERM]) -> ERL_N
 }
 
 /// `make_map` without the fallback: `None` when a key repeats.
+///
+/// Checks the size of a map past the flatmap limit: before erlang/otp#10976,
+/// `enif_make_map_from_arrays` reported success for a hashmap-sized input with
+/// duplicate keys and returned an invalid map.
 #[inline]
 pub fn try_make_map(
     env: Env,
     keys: &[ERL_NIF_TERM],
     vals: &[ERL_NIF_TERM],
 ) -> Option<ERL_NIF_TERM> {
+    let count = keys.len();
+    assert_eq!(count, vals.len(), "every key needs a value");
     let mut map: ERL_NIF_TERM = 0;
-    // SAFETY: `keys` and `vals` are live slices of `keys.len()` terms.
-    unsafe { map_from_arrays(env, keys.as_ptr(), vals.as_ptr(), keys.len(), &mut map) }
-        .then_some(map)
+    // SAFETY: `keys` and `vals` are live slices of `count` terms, and `map` is
+    // a local the call writes.
+    let built = unsafe {
+        enif_make_map_from_arrays(
+            env.as_c_arg(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            count,
+            &mut map,
+        )
+    };
+    if built == 0 {
+        return None;
+    }
+    if count <= FLATMAP_LIMIT {
+        return Some(map);
+    }
+    let mut size = 0;
+    // SAFETY: `map` is the map just built in this env.
+    let sized = unsafe { enif_get_map_size(env.as_c_arg(), map, &mut size) } != 0;
+    (sized && size == count).then_some(map)
 }
 
 /// Map of an object whose keys repeat: members inserted in source order, so
